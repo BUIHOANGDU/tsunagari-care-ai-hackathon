@@ -11,6 +11,7 @@ const DEFAULT_TSUNAGARI_BRIDGE_API_URL =
 const DEFAULT_TSUNAGARI_DEVICE_TOKEN = "DEV_TOKEN";
 const TOKYO_TIMEZONE = "Asia/Tokyo";
 const WEATHER_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+const ROOM_ENVIRONMENT_STALE_MS = 2 * 60 * 1000;
 const CARE_LOG_DISPLAY_LIMIT = 3;
 const ALERT_DISPLAY_LIMIT = 1;
 const CAREGIVER_NOTIFICATION_DISPLAY_LIMIT = 3;
@@ -47,6 +48,7 @@ const DEFAULT_MEDICINE_REMINDER = {
 const ROOM_ENVIRONMENT_DEMO = {
   temperatureC: 25,
   humidityPercent: 50,
+  pressureHpa: null,
   source: "demo",
   updatedAt: new Date().toISOString(),
   online: true,
@@ -117,6 +119,11 @@ function formatTemperature(value, digits = 0) {
   return `${parsed.toFixed(digits).replace(/\.0$/, "")}°C`;
 }
 
+function asFiniteNumberOrNull(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function getLocalizedLocationName(location = {}) {
   const name = String(location.name || "").trim();
   return name.toLowerCase() === "tokyo" ? uiText("tokyo") : name || uiText("tokyo");
@@ -153,7 +160,58 @@ function getWeatherIcon(kind) {
   return icons[kind] || icons.unknownWeather;
 }
 
+function normalizeSmartHomeEnvironment(device) {
+  if (!device || typeof device !== "object") return null;
+
+  const environment = device.environment;
+  if (!environment || typeof environment !== "object") return null;
+
+  const sensorAvailable =
+    environment.sensorAvailable === true ||
+    environment.bme280Available === true;
+  if (!sensorAvailable) return null;
+
+  const temperatureC = asFiniteNumberOrNull(
+    environment.temperature ?? environment.temperatureC ?? environment.roomTemperature,
+  );
+  const humidityPercent = asFiniteNumberOrNull(
+    environment.humidity ?? environment.humidityPercent,
+  );
+  const pressureHpa = asFiniteNumberOrNull(
+    environment.pressure ?? environment.pressureHpa,
+  );
+
+  if (temperatureC === null || humidityPercent === null) return null;
+
+  const updatedAt =
+    environment.updatedAt ||
+    device.environmentUpdatedAt ||
+    device.updatedAt ||
+    null;
+  const updatedAtMs = getTimeValue(updatedAt);
+  const stale =
+    updatedAtMs > 0 &&
+    Date.now() - updatedAtMs > ROOM_ENVIRONMENT_STALE_MS;
+
+  if (stale) return null;
+
+  return {
+    temperatureC,
+    humidityPercent,
+    pressureHpa,
+    source: "BME280",
+    updatedAt,
+    online: device.status !== "offline",
+    temperatureDigits: 1,
+  };
+}
+
 function getRoomEnvironment() {
+  const smartHomeEnvironment = normalizeSmartHomeEnvironment(
+    latestSmartHomeBridgeDevice,
+  );
+  if (smartHomeEnvironment) return smartHomeEnvironment;
+
   return ROOM_ENVIRONMENT_DEMO;
 }
 
@@ -173,10 +231,21 @@ function renderRoomEnvironment() {
   const badgeEl = document.getElementById("room-demo-badge");
 
   if (temperatureEl) {
-    temperatureEl.textContent = formatTemperature(room.temperatureC);
+    temperatureEl.textContent = formatTemperature(
+      room.temperatureC,
+      room.temperatureDigits || 0,
+    );
   }
   if (humidityEl) {
-    humidityEl.textContent = `${uiText("humidity")} ${Math.round(room.humidityPercent)}%`;
+    const humidity =
+      Number.isFinite(Number(room.humidityPercent))
+        ? `${uiText("humidity")} ${Math.round(room.humidityPercent)}%`
+        : `${uiText("humidity")} --%`;
+    const pressure =
+      Number.isFinite(Number(room.pressureHpa))
+        ? ` · ${Math.round(room.pressureHpa)} hPa`
+        : "";
+    humidityEl.textContent = `${humidity}${pressure}`;
   }
   if (badgeEl) {
     badgeEl.textContent = room.source === "demo" ? uiText("demo") : room.source;
@@ -447,11 +516,13 @@ function updateDevicesSection(devices) {
   const devicesDisplay = document.getElementById("devices-display");
   if (devicesDisplay) devicesDisplay.textContent = devices.length || 0;
   renderDevices(devices);
+  renderRoomEnvironment();
 }
 
 let latestBridgeRobot = null;
 let latestLegacyRobot = null;
 let latestSmartHomeDevices = [];
+let latestSmartHomeBridgeDevice = null;
 let latestFallResponseCareEvents = [];
 let latestChamiAlertsForCareEventMapping = [];
 const mappedChamiEmergencyAlertIds = new Set();
@@ -471,6 +542,10 @@ function getDeviceId(device) {
   return device?.id || device?.deviceId || "";
 }
 
+function isSmartHomeBridgeDevice(device) {
+  return getDeviceId(device) === SMART_HOME_DEVICE_ID;
+}
+
 function isLightDevice(device) {
   const id = getDeviceId(device);
   return (
@@ -487,7 +562,7 @@ function isAirconDevice(device) {
 
 function getSmartHomeDevicesForDisplay(devices) {
   const smartHomeDevices = (devices || []).filter(
-    (device) => !isBridgeChamiDevice(device),
+    (device) => !isBridgeChamiDevice(device) && !isSmartHomeBridgeDevice(device),
   );
   const hasBridgeLight = smartHomeDevices.some(
     (device) => getDeviceId(device) === LIGHT_DEVICE_ID,
@@ -739,6 +814,7 @@ updateDevicesSection = function (devices) {
   const data = devices || [];
   const smartHomeDevices = getSmartHomeDevicesForDisplay(data);
   const bridgeRobot = data.find((device) => device?.id === "chami_001");
+  const smartHomeBridge = data.find(isSmartHomeBridgeDevice);
 
   latestSmartHomeDevices = smartHomeDevices.map((device) =>
     isLightDevice(device)
@@ -746,11 +822,13 @@ updateDevicesSection = function (devices) {
       : device,
   );
   latestBridgeRobot = bridgeRobot || null;
+  latestSmartHomeBridgeDevice = smartHomeBridge || null;
   updateRobotSection(pickRobotForDisplay());
 
   document.getElementById("devices-count").textContent =
     latestSmartHomeDevices.length || 0;
   renderDevices(latestSmartHomeDevices);
+  renderRoomEnvironment();
 };
 
 function refreshRobotPresenceDisplay() {

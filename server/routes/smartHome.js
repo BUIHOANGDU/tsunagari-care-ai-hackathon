@@ -25,6 +25,64 @@ function getIsoTimestamp() {
   return new Date().toISOString();
 }
 
+function asOptionalFiniteNumber(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function buildEnvironmentUpdate(input) {
+  if (input === undefined) {
+    return null;
+  }
+
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    const error = new Error("environment must be an object");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const sensorAvailable =
+    input.sensorAvailable === true ||
+    input.bme280Available === true;
+  if (!sensorAvailable) {
+    return {
+      sensorAvailable: false,
+      updatedAt: getServerTimestamp(),
+    };
+  }
+
+  const temperature = asOptionalFiniteNumber(
+    input.temperature ?? input.temperatureC ?? input.roomTemperature,
+  );
+  const humidity = asOptionalFiniteNumber(
+    input.humidity ?? input.humidityPercent,
+  );
+  const pressure = asOptionalFiniteNumber(input.pressure ?? input.pressureHpa);
+
+  if (temperature === null || humidity === null) {
+    const error = new Error("environment temperature and humidity are required when sensorAvailable is true");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const environment = {
+    sensorAvailable: true,
+    temperature,
+    humidity,
+    updatedAt: getServerTimestamp(),
+  };
+
+  if (pressure !== null) {
+    environment.pressure = pressure;
+  }
+
+  return environment;
+}
+
 function getMissingIrCommandField(body = {}) {
   if (typeof body.key !== "string" || body.key.trim() === "") {
     return "key";
@@ -346,6 +404,7 @@ router.post("/device-status", deviceAuth, async (req, res) => {
     type = "device",
     status,
     source = "smart_home_001",
+    environment,
   } = req.body || {};
 
   if (!deviceId) {
@@ -363,26 +422,34 @@ router.post("/device-status", deviceAuth, async (req, res) => {
   }
 
   try {
+    const environmentUpdate = buildEnvironmentUpdate(environment);
+    const updatePayload = {
+      id: deviceId,
+      name: name || deviceId,
+      type,
+      status,
+      source,
+      updatedAt: getServerTimestamp(),
+    };
+
+    if (environmentUpdate) {
+      updatePayload.environment = environmentUpdate;
+    }
+
     await getDb()
       .ref(`devices/${deviceId}`)
-      .update({
-        id: deviceId,
-        name: name || deviceId,
-        type,
-        status,
-        source,
-        updatedAt: getServerTimestamp(),
-      });
+      .update(updatePayload);
 
     return res.json({
       ok: true,
       deviceId,
+      environmentUpdated: Boolean(environmentUpdate),
       message: "Device status updated",
     });
   } catch (error) {
     console.error("Smart home device status update failed:", error);
 
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       ok: false,
       error: error.message,
     });

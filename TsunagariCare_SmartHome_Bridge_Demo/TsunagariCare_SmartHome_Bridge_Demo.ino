@@ -1,23 +1,97 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <Wire.h>
 #include <ArduinoJson.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
 #include <IRremoteESP8266.h>
 #include <IRrecv.h>
 #include <IRsend.h>
 #include <IRutils.h>
 #include "config.h"
+#include "SmartHomeState.h"
+#include "SmartHomeCommand.h"
+#include "SmartHomeDisplay.h"
+#include "SmartHomeTouch.h"
+#include "SmartHomeFeedback.h"
+
+#ifndef SMART_HOME_DEMO_MODE
+#define SMART_HOME_DEMO_MODE 0
+#endif
+
+#ifndef DEMO_LIVING_LED_PIN
+#define DEMO_LIVING_LED_PIN -1
+#endif
+
+#ifndef DEMO_BEDROOM_LED_PIN
+#define DEMO_BEDROOM_LED_PIN -1
+#endif
+
+#ifndef DEMO_AC_LED_PIN
+#define DEMO_AC_LED_PIN -1
+#endif
+
+#ifndef BME280_SDA_PIN
+#define BME280_SDA_PIN 21
+#endif
+
+#ifndef BME280_SCL_PIN
+#define BME280_SCL_PIN 22
+#endif
 
 const unsigned long CHECK_INTERVAL_MS = 3000;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 5000;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+const unsigned long HTTP_TIMEOUT_MS = 4000;
+const unsigned long DONE_RETRY_INTERVAL_MS = 5000;
+const unsigned long INITIAL_STATUS_RETRY_INTERVAL_MS = 5000;
+const unsigned long ENVIRONMENT_STATUS_SYNC_INTERVAL_MS = 10000;
+const unsigned long BME280_READ_INTERVAL_MS = 2000;
+const unsigned long BME280_RETRY_INTERVAL_MS = 10000;
 const uint16_t IR_CAPTURE_BUFFER_SIZE = 1024;
 const uint8_t IR_CAPTURE_TIMEOUT_MS = 50;
 const uint16_t IR_SEND_RAW_BUFFER_SIZE = 1024;
+const int AC_MIN_TEMPERATURE = 16;
+const int AC_MAX_TEMPERATURE = 30;
+const uint8_t BME280_ADDRESS_PRIMARY = 0x76;
+const uint8_t BME280_ADDRESS_SECONDARY = 0x77;
+const uint8_t BME280_EXPECTED_CHIP_ID = 0x60;
+const uint8_t BME280_MAX_READ_FAILURES = 3;
+
+const char *V2_LIVING_LIGHT_DEVICE_ID = "living_light";
+const char *V2_BEDROOM_LIGHT_DEVICE_ID = "bedroom_light";
+const char *V2_AIR_CONDITIONER_DEVICE_ID = "air_conditioner";
+
+enum WifiConnectionState
+{
+  WIFI_DISCONNECTED,
+  WIFI_CONNECTING,
+  WIFI_CONNECTED
+};
 
 bool lightIsOn = false;
+SmartHomeState smartHomeState;
+WifiConnectionState wifiConnectionState = WIFI_DISCONNECTED;
 unsigned long lastCheckAt = 0;
+unsigned long wifiConnectStartedAt = 0;
+unsigned long lastWifiRetryAt = 0;
+unsigned long lastDoneRetryAt = 0;
+unsigned long lastInitialStatusSyncAt = 0;
+unsigned long lastEnvironmentStatusSyncAt = 0;
+unsigned long lastBME280ReadAt = 0;
+unsigned long lastBME280RetryAt = 0;
 bool irLearnMode = false;
 unsigned long irLearnStartedAt = 0;
 const unsigned long IR_LEARN_TIMEOUT_MS = 30000;
+bool initialDeviceStatusPending = true;
+bool pendingDoneRetry = false;
+uint8_t bme280Address = 0;
+uint8_t bme280ReadFailures = 0;
+String lastExecutedCommandId = "";
+String pendingDoneCommandId = "";
+String pendingDoneResult = "";
+String pendingDoneMessage = "";
 String pendingLearnCommandId = "";
 String pendingLearnKey = "";
 String pendingLearnName = "";
@@ -30,25 +104,101 @@ IRrecv irrecv(
     true);
 IRsend irsend(IR_SEND_PIN);
 decode_results irResults;
+Adafruit_BME280 bme280;
+SmartHomeDisplay smartHomeDisplay;
+SmartHomeTouch smartHomeTouch;
+SmartHomeFeedback smartHomeFeedback;
+unsigned long localTouchCommandSequence = 0;
 
 void connectWiFi()
 {
+  unsigned long now = millis();
+
+  if (wifiConnectionState == WIFI_CONNECTING)
+  {
+    return;
+  }
+
   Serial.print("Connecting to Wi-Fi: ");
   Serial.println(WIFI_SSID);
+  Serial.println("WiFi CONNECTING");
+
+  smartHomeState.wifiConnected = false;
+  smartHomeState.serverConnected = false;
+  wifiConnectionState = WIFI_CONNECTING;
+  wifiConnectStartedAt = now;
+  lastWifiRetryAt = now;
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
 
-  while (WiFi.status() != WL_CONNECTED)
+void updateNetworkState()
+{
+  unsigned long now = millis();
+  wl_status_t wifiStatus = WiFi.status();
+
+  if (wifiStatus == WL_CONNECTED)
   {
-    delay(500);
-    Serial.print(".");
+    if (wifiConnectionState != WIFI_CONNECTED)
+    {
+      wifiConnectionState = WIFI_CONNECTED;
+      smartHomeState.wifiConnected = true;
+      Serial.println("WiFi CONNECTED");
+      Serial.print("ESP32 IP: ");
+      Serial.println(WiFi.localIP());
+    }
+    return;
   }
 
-  Serial.println();
-  Serial.println("Wi-Fi connected");
-  Serial.print("ESP32 IP: ");
-  Serial.println(WiFi.localIP());
+  if (wifiConnectionState == WIFI_CONNECTED)
+  {
+    Serial.println("WiFi DISCONNECTED");
+  }
+
+  smartHomeState.wifiConnected = false;
+  smartHomeState.serverConnected = false;
+
+  if (wifiConnectionState == WIFI_CONNECTING)
+  {
+    if (now - wifiConnectStartedAt >= WIFI_CONNECT_TIMEOUT_MS)
+    {
+      Serial.println("WiFi DISCONNECTED connect timeout");
+      WiFi.disconnect(false);
+      wifiConnectionState = WIFI_DISCONNECTED;
+      lastWifiRetryAt = now;
+    }
+    return;
+  }
+
+  wifiConnectionState = WIFI_DISCONNECTED;
+
+  if (lastWifiRetryAt == 0 || now - lastWifiRetryAt >= WIFI_RETRY_INTERVAL_MS)
+  {
+    Serial.println("WiFi RETRY");
+    connectWiFi();
+  }
+}
+
+bool isWifiReadyForBridge()
+{
+  return WiFi.status() == WL_CONNECTED && smartHomeState.wifiConnected;
+}
+
+void updateServerConnectivity(int statusCode)
+{
+  if (!isWifiReadyForBridge())
+  {
+    smartHomeState.serverConnected = false;
+    return;
+  }
+
+  bool reachable = statusCode > 0;
+  if (smartHomeState.serverConnected != reachable)
+  {
+    Serial.println(reachable ? "Server REACHABLE" : "Server TRANSPORT ERROR");
+  }
+  smartHomeState.serverConnected = reachable;
 }
 
 bool isHttpsBridgeUrl(const String &url)
@@ -117,10 +267,11 @@ void logBridgeResponse(
 
 String httpGetBridge(const String &path)
 {
-  if (WiFi.status() != WL_CONNECTED)
+  if (!isWifiReadyForBridge())
   {
-    Serial.println("Wi-Fi disconnected, reconnecting before GET");
-    connectWiFi();
+    smartHomeState.wifiConnected = false;
+    smartHomeState.serverConnected = false;
+    return "";
   }
 
   HTTPClient http;
@@ -133,13 +284,16 @@ String httpGetBridge(const String &path)
 
   if (!beginBridgeRequest(http, secureClient, url, "GET"))
   {
+    updateServerConnectivity(-1);
     return "";
   }
 
+  http.setTimeout(HTTP_TIMEOUT_MS);
   http.addHeader("x-device-token", DEVICE_TOKEN);
 
   int statusCode = http.GET();
   String payload = http.getString();
+  updateServerConnectivity(statusCode);
 
   logBridgeResponse("GET", statusCode, payload, usingHttps, http);
 
@@ -149,10 +303,11 @@ String httpGetBridge(const String &path)
 
 String httpPostBridge(const String &path, const String &jsonBody)
 {
-  if (WiFi.status() != WL_CONNECTED)
+  if (!isWifiReadyForBridge())
   {
-    Serial.println("Wi-Fi disconnected, reconnecting before POST");
-    connectWiFi();
+    smartHomeState.wifiConnected = false;
+    smartHomeState.serverConnected = false;
+    return "";
   }
 
   HTTPClient http;
@@ -167,14 +322,17 @@ String httpPostBridge(const String &path, const String &jsonBody)
 
   if (!beginBridgeRequest(http, secureClient, url, "POST"))
   {
+    updateServerConnectivity(-1);
     return "";
   }
 
+  http.setTimeout(HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-token", DEVICE_TOKEN);
 
   int statusCode = http.POST(jsonBody);
   String payload = http.getString();
+  updateServerConnectivity(statusCode);
 
   logBridgeResponse("POST", statusCode, payload, usingHttps, http);
 
@@ -187,10 +345,15 @@ int httpPostBridgeStatus(
     const String &jsonBody,
     String *responsePayload)
 {
-  if (WiFi.status() != WL_CONNECTED)
+  if (!isWifiReadyForBridge())
   {
-    Serial.println("Wi-Fi disconnected, reconnecting before POST");
-    connectWiFi();
+    smartHomeState.wifiConnected = false;
+    smartHomeState.serverConnected = false;
+    if (responsePayload != nullptr)
+    {
+      *responsePayload = "";
+    }
+    return -1;
   }
 
   HTTPClient http;
@@ -207,6 +370,7 @@ int httpPostBridgeStatus(
 
   if (!beginBridgeRequest(http, secureClient, url, "POST"))
   {
+    updateServerConnectivity(-1);
     if (responsePayload != nullptr)
     {
       *responsePayload = "";
@@ -214,11 +378,13 @@ int httpPostBridgeStatus(
     return -1;
   }
 
+  http.setTimeout(HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-token", DEVICE_TOKEN);
 
   int statusCode = http.POST(jsonBody);
   String payload = http.getString();
+  updateServerConnectivity(statusCode);
 
   if (responsePayload != nullptr)
   {
@@ -228,6 +394,162 @@ int httpPostBridgeStatus(
   logBridgeResponse("POST", statusCode, payload, usingHttps, http);
   http.end();
   return statusCode;
+}
+
+void printBME280Address(uint8_t address)
+{
+  Serial.print("0x");
+  Serial.print(address, HEX);
+}
+
+void clearBME280Readings()
+{
+  smartHomeState.roomTemperature = NAN;
+  smartHomeState.humidity = NAN;
+  smartHomeState.pressure = NAN;
+}
+
+bool isValidBME280Reading(float temperature, float humidity, float pressureHpa)
+{
+  return !isnan(temperature) &&
+         !isnan(humidity) &&
+         !isnan(pressureHpa) &&
+         humidity >= 0.0F &&
+         humidity <= 100.0F &&
+         pressureHpa > 0.0F;
+}
+
+bool tryBeginBME280(uint8_t address, bool logProbe)
+{
+  if (logProbe)
+  {
+    Serial.print("BME280: probing ");
+    printBME280Address(address);
+    Serial.println("...");
+  }
+
+  if (!bme280.begin(address, &Wire))
+  {
+    return false;
+  }
+
+  uint8_t chipId = bme280.sensorID();
+  if (chipId != BME280_EXPECTED_CHIP_ID)
+  {
+    if (logProbe)
+    {
+      Serial.print("BME280: unexpected sensor/chip 0x");
+      Serial.println(chipId, HEX);
+    }
+    return false;
+  }
+
+  bme280Address = address;
+  bme280ReadFailures = 0;
+  smartHomeState.bme280Available = true;
+
+  Serial.print("BME280: detected at ");
+  printBME280Address(address);
+  Serial.println();
+  return true;
+}
+
+bool probeBME280(bool logProbe)
+{
+  lastBME280RetryAt = millis();
+  smartHomeState.bme280Available = false;
+  bme280Address = 0;
+
+  if (tryBeginBME280(BME280_ADDRESS_PRIMARY, logProbe))
+  {
+    return true;
+  }
+
+  if (tryBeginBME280(BME280_ADDRESS_SECONDARY, logProbe))
+  {
+    return true;
+  }
+
+  if (logProbe)
+  {
+    Serial.println("BME280: NOT FOUND");
+  }
+  return false;
+}
+
+void setupBME280()
+{
+  clearBME280Readings();
+  smartHomeState.bme280Available = false;
+
+  Serial.print("BME280: I2C SDA=");
+  Serial.print(BME280_SDA_PIN);
+  Serial.print(" SCL=");
+  Serial.println(BME280_SCL_PIN);
+
+  Wire.begin(BME280_SDA_PIN, BME280_SCL_PIN);
+  probeBME280(true);
+}
+
+void markBME280Unavailable()
+{
+  if (smartHomeState.bme280Available)
+  {
+    Serial.println("BME280: read failed repeatedly, marking unavailable");
+  }
+
+  smartHomeState.bme280Available = false;
+  bme280Address = 0;
+  clearBME280Readings();
+}
+
+void updateBME280(unsigned long now)
+{
+  if (!smartHomeState.bme280Available)
+  {
+    if (lastBME280RetryAt == 0 ||
+        now - lastBME280RetryAt >= BME280_RETRY_INTERVAL_MS)
+    {
+      bool recovered = probeBME280(false);
+      if (recovered)
+      {
+        Serial.println("BME280: recovered");
+      }
+    }
+    return;
+  }
+
+  if (lastBME280ReadAt != 0 &&
+      now - lastBME280ReadAt < BME280_READ_INTERVAL_MS)
+  {
+    return;
+  }
+  lastBME280ReadAt = now;
+
+  float temperature = bme280.readTemperature();
+  float humidity = bme280.readHumidity();
+  // Adafruit_BME280 returns pressure in Pa. SmartHomeState stores hPa for UI.
+  float pressureHpa = bme280.readPressure() / 100.0F;
+
+  if (!isValidBME280Reading(temperature, humidity, pressureHpa))
+  {
+    bme280ReadFailures++;
+    if (bme280ReadFailures >= BME280_MAX_READ_FAILURES)
+    {
+      markBME280Unavailable();
+    }
+    return;
+  }
+
+  if (bme280ReadFailures > 0)
+  {
+    Serial.println("BME280: read recovered");
+  }
+  bme280ReadFailures = 0;
+
+  smartHomeState.roomTemperature = temperature;
+  smartHomeState.humidity = humidity;
+  smartHomeState.pressure = pressureHpa;
 }
 
 void setupIR()
@@ -495,7 +817,7 @@ bool fetchIRCommandRawData(
   return true;
 }
 
-void sendSavedIRCommand(const String &commandId, const String &key)
+bool sendSavedIRCommand(const String &commandId, const String &key)
 {
   uint16_t rawBuffer[IR_SEND_RAW_BUFFER_SIZE];
   uint16_t rawLength = 0;
@@ -511,7 +833,7 @@ void sendSavedIRCommand(const String &commandId, const String &key)
   {
     updateDeviceStatus(IR_HUB_DEVICE_ID, "send_failed:" + key);
     markCommandDone(commandId, "ir_command_not_found", "IR command not found or invalid");
-    return;
+    return false;
   }
 
   const bool isAirconKey = key.startsWith("ac_");
@@ -545,9 +867,10 @@ void sendSavedIRCommand(const String &commandId, const String &key)
   Serial.println("IR command sent");
   updateDeviceStatus(IR_HUB_DEVICE_ID, "sent:" + key);
   markCommandDone(commandId, "ir_sent", "IR command sent");
+  return true;
 }
 
-void updateDeviceStatusDetailed(
+bool updateDeviceStatusDetailed(
     const String &deviceId,
     const String &name,
     const String &type,
@@ -568,28 +891,89 @@ void updateDeviceStatusDetailed(
   Serial.print(" -> ");
   Serial.println(status);
 
-  httpPostBridge("/api/smart-home/device-status", body);
+  String responsePayload;
+  int statusCode = httpPostBridgeStatus(
+      "/api/smart-home/device-status",
+      body,
+      &responsePayload);
+  return statusCode >= 200 && statusCode < 300;
 }
 
-void updateDeviceStatus(const String &deviceId, const String &status)
+bool updateDeviceStatus(const String &deviceId, const String &status)
 {
   if (deviceId == LIGHT_DEVICE_ID)
   {
-    updateDeviceStatusDetailed(deviceId, "Den phong khach", "light", status);
-    return;
+    return updateDeviceStatusDetailed(deviceId, "Den phong khach", "light", status);
   }
 
   if (deviceId == IR_HUB_DEVICE_ID)
   {
-    updateDeviceStatusDetailed(deviceId, "IR Hub", "ir_hub", status);
+    return updateDeviceStatusDetailed(deviceId, "IR Hub", "ir_hub", status);
+  }
+
+  return updateDeviceStatusDetailed(deviceId, "Unknown Device", "unknown", status);
+}
+
+bool updateSmartHomeEnvironmentStatus()
+{
+  StaticJsonDocument<384> doc;
+  doc["deviceId"] = SMART_HOME_DEVICE_ID;
+  doc["name"] = "Smart Home Bridge";
+  doc["type"] = "smart_home";
+  doc["status"] = "online";
+  doc["source"] = SMART_HOME_DEVICE_ID;
+
+  JsonObject environment = doc.createNestedObject("environment");
+  environment["sensorAvailable"] = smartHomeState.bme280Available;
+  if (smartHomeState.bme280Available &&
+      isValidBME280Reading(
+          smartHomeState.roomTemperature,
+          smartHomeState.humidity,
+          smartHomeState.pressure))
+  {
+    environment["temperature"] = smartHomeState.roomTemperature;
+    environment["humidity"] = smartHomeState.humidity;
+    environment["pressure"] = smartHomeState.pressure;
+  }
+
+  String body;
+  serializeJson(doc, body);
+
+  Serial.print("Syncing Smart Home environment: sensorAvailable=");
+  Serial.println(smartHomeState.bme280Available ? "true" : "false");
+
+  String responsePayload;
+  int statusCode = httpPostBridgeStatus(
+      "/api/smart-home/device-status",
+      body,
+      &responsePayload);
+  return statusCode >= 200 && statusCode < 300;
+}
+
+void syncSmartHomeEnvironmentStatus(unsigned long now)
+{
+  if (!isWifiReadyForBridge())
+  {
     return;
   }
 
-  updateDeviceStatusDetailed(deviceId, "Unknown Device", "unknown", status);
+  if (lastEnvironmentStatusSyncAt != 0 &&
+      now - lastEnvironmentStatusSyncAt < ENVIRONMENT_STATUS_SYNC_INTERVAL_MS)
+  {
+    return;
+  }
+
+  lastEnvironmentStatusSyncAt = now;
+  updateSmartHomeEnvironmentStatus();
 }
 
-void markCommandDone(const String &commandId, const String &result, const String &message)
+bool markCommandDone(const String &commandId, const String &result, const String &message)
 {
+  if (commandId == "")
+  {
+    return false;
+  }
+
   StaticJsonDocument<256> doc;
   doc["deviceId"] = SMART_HOME_DEVICE_ID;
   doc["result"] = result;
@@ -603,7 +987,92 @@ void markCommandDone(const String &commandId, const String &result, const String
   Serial.print(" result=");
   Serial.println(result);
 
-  httpPostBridge("/api/smart-home/commands/" + commandId + "/done", body);
+  String responsePayload;
+  int statusCode = httpPostBridgeStatus(
+      "/api/smart-home/commands/" + commandId + "/done",
+      body,
+      &responsePayload);
+  bool doneOk = statusCode >= 200 && statusCode < 300;
+
+  if (doneOk)
+  {
+    if (pendingDoneRetry && pendingDoneCommandId == commandId)
+    {
+      pendingDoneRetry = false;
+      pendingDoneCommandId = "";
+      pendingDoneResult = "";
+      pendingDoneMessage = "";
+    }
+    return true;
+  }
+
+  if (statusCode > 0 && statusCode < 500 && statusCode != 408 && statusCode != 429)
+  {
+    if (pendingDoneRetry && pendingDoneCommandId == commandId)
+    {
+      pendingDoneRetry = false;
+      pendingDoneCommandId = "";
+      pendingDoneResult = "";
+      pendingDoneMessage = "";
+    }
+    Serial.println("Command done application error; not retrying");
+    return false;
+  }
+
+  pendingDoneRetry = true;
+  pendingDoneCommandId = commandId;
+  pendingDoneResult = result;
+  pendingDoneMessage = message;
+  Serial.println("Command done pending retry");
+  return false;
+}
+
+void retryPendingCommandDone(unsigned long now)
+{
+  if (!pendingDoneRetry)
+  {
+    return;
+  }
+
+  if (!isWifiReadyForBridge())
+  {
+    return;
+  }
+
+  if (now - lastDoneRetryAt < DONE_RETRY_INTERVAL_MS)
+  {
+    return;
+  }
+
+  lastDoneRetryAt = now;
+  Serial.print("Retrying command done: ");
+  Serial.println(pendingDoneCommandId);
+  markCommandDone(pendingDoneCommandId, pendingDoneResult, pendingDoneMessage);
+}
+
+void syncInitialDeviceStatus(unsigned long now)
+{
+  if (!initialDeviceStatusPending)
+  {
+    return;
+  }
+
+  if (!isWifiReadyForBridge())
+  {
+    return;
+  }
+
+  if (lastInitialStatusSyncAt != 0 &&
+      now - lastInitialStatusSyncAt < INITIAL_STATUS_RETRY_INTERVAL_MS)
+  {
+    return;
+  }
+
+  lastInitialStatusSyncAt = now;
+  Serial.println("Syncing initial device status");
+  bool lightStatusOk = updateDeviceStatus(LIGHT_DEVICE_ID, "off");
+  bool irHubStatusOk = updateDeviceStatus(IR_HUB_DEVICE_ID, "online");
+  initialDeviceStatusPending = !(lightStatusOk && irHubStatusOk);
 }
 
 void startIRLearnMode(
@@ -701,134 +1170,482 @@ void handleIRLearnMode()
   }
 }
 
-void processCommand(
-    const String &commandId,
-    const String &type,
-    const String &device,
-    const String &action,
-    const String &irCommandId,
-    const String &key,
-    const String &name,
-    const String &category,
-    const String &description)
+bool isDemoModeEnabled()
+{
+  return SMART_HOME_DEMO_MODE != 0;
+}
+
+bool isDemoPinConfigured(int pin)
+{
+  return pin >= 0;
+}
+
+void writeDemoPin(int pin, bool enabled)
+{
+  if (!isDemoModeEnabled() || !isDemoPinConfigured(pin))
+  {
+    return;
+  }
+
+  digitalWrite(pin, enabled ? HIGH : LOW);
+}
+
+void configureDemoPin(int pin)
+{
+  if (!isDemoModeEnabled() || !isDemoPinConfigured(pin))
+  {
+    return;
+  }
+
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
+}
+
+void applyLivingLightOutput()
+{
+  digitalWrite(LED_PIN, smartHomeState.livingLight ? HIGH : LOW);
+
+  if (DEMO_LIVING_LED_PIN != LED_PIN)
+  {
+    writeDemoPin(DEMO_LIVING_LED_PIN, smartHomeState.livingLight);
+  }
+}
+
+void applyBedroomLightOutput()
+{
+  writeDemoPin(DEMO_BEDROOM_LED_PIN, smartHomeState.bedroomLight);
+}
+
+void applyAirConditionerOutput()
+{
+  writeDemoPin(DEMO_AC_LED_PIN, smartHomeState.acPower);
+}
+
+void applyDeviceOutputs()
+{
+  applyLivingLightOutput();
+  applyBedroomLightOutput();
+  applyAirConditionerOutput();
+}
+
+void setupDeviceOutputs()
+{
+  pinMode(LED_PIN, OUTPUT);
+  configureDemoPin(DEMO_LIVING_LED_PIN);
+  configureDemoPin(DEMO_BEDROOM_LED_PIN);
+  configureDemoPin(DEMO_AC_LED_PIN);
+  applyDeviceOutputs();
+}
+
+void logDemoOutputConfiguration()
+{
+  Serial.print("Smart Home demo mode: ");
+  Serial.println(isDemoModeEnabled() ? "enabled" : "disabled");
+  Serial.print("Demo living LED pin: ");
+  Serial.println(DEMO_LIVING_LED_PIN);
+  Serial.print("Demo bedroom LED pin: ");
+  Serial.println(DEMO_BEDROOM_LED_PIN);
+  Serial.print("Demo AC LED pin: ");
+  Serial.println(DEMO_AC_LED_PIN);
+}
+
+void setLivingLightState(bool enabled)
+{
+  lightIsOn = enabled;
+  smartHomeState.livingLight = enabled;
+  applyLivingLightOutput();
+}
+
+void setBedroomLightState(bool enabled)
+{
+  smartHomeState.bedroomLight = enabled;
+  applyBedroomLightOutput();
+}
+
+void setAirConditionerPower(bool enabled)
+{
+  smartHomeState.acPower = enabled;
+  applyAirConditionerOutput();
+}
+
+bool isValidAcTemperature(int temperature)
+{
+  return temperature >= AC_MIN_TEMPERATURE &&
+         temperature <= AC_MAX_TEMPERATURE;
+}
+
+int clampAcTemperature(int temperature)
+{
+  if (temperature < AC_MIN_TEMPERATURE)
+  {
+    return AC_MIN_TEMPERATURE;
+  }
+
+  if (temperature > AC_MAX_TEMPERATURE)
+  {
+    return AC_MAX_TEMPERATURE;
+  }
+
+  return temperature;
+}
+
+void setAirConditionerTemperature(int temperature)
+{
+  smartHomeState.acSetTemperature = clampAcTemperature(temperature);
+}
+
+void applyIrStateHint(const String &key)
+{
+  if (key == "ac_cool_26")
+  {
+    setAirConditionerPower(true);
+    setAirConditionerTemperature(26);
+    return;
+  }
+
+  if (key == "ac_off")
+  {
+    setAirConditionerPower(false);
+    return;
+  }
+}
+
+bool isV2DeviceId(const String &device)
+{
+  return device == V2_LIVING_LIGHT_DEVICE_ID ||
+         device == V2_BEDROOM_LIGHT_DEVICE_ID ||
+         device == V2_AIR_CONDITIONER_DEVICE_ID;
+}
+
+String lightResultForDevice(const String &device, bool enabled)
+{
+  String result = device;
+  result += enabled ? "_on" : "_off";
+  return result;
+}
+
+void dispatchV2LightCommand(const SmartHomeCommand &command)
+{
+  bool *state = nullptr;
+
+  if (command.device == V2_LIVING_LIGHT_DEVICE_ID)
+  {
+    state = &smartHomeState.livingLight;
+  }
+  else if (command.device == V2_BEDROOM_LIGHT_DEVICE_ID)
+  {
+    state = &smartHomeState.bedroomLight;
+  }
+  else
+  {
+    completeCommand(command, "unsupported_device", "Unsupported light device");
+    return;
+  }
+
+  bool nextState = *state;
+
+  if (command.action == "on")
+  {
+    nextState = true;
+  }
+  else if (command.action == "off")
+  {
+    nextState = false;
+  }
+  else if (command.action == "toggle")
+  {
+    nextState = !nextState;
+  }
+  else
+  {
+    completeCommand(command, "unsupported_action", "Unsupported light action");
+    return;
+  }
+
+  if (command.device == V2_LIVING_LIGHT_DEVICE_ID)
+  {
+    setLivingLightState(nextState);
+  }
+  else
+  {
+    setBedroomLightState(nextState);
+  }
+
+  rememberCommandExecution(command);
+  notifyCommandSuccess(command);
+  completeCommand(
+      command,
+      lightResultForDevice(command.device, nextState),
+      "Light command executed");
+}
+
+void dispatchV2AirConditionerCommand(const SmartHomeCommand &command)
+{
+  String result;
+
+  if (command.action == "on")
+  {
+    setAirConditionerPower(true);
+    result = "ac_on";
+  }
+  else if (command.action == "off")
+  {
+    setAirConditionerPower(false);
+    result = "ac_off";
+  }
+  else if (command.action == "toggle")
+  {
+    setAirConditionerPower(!smartHomeState.acPower);
+    result = smartHomeState.acPower ? "ac_on" : "ac_off";
+  }
+  else if (command.action == "set_temperature")
+  {
+    if (!command.hasValue)
+    {
+      completeCommand(command, "missing_temperature", "Missing AC temperature");
+      return;
+    }
+
+    if (!isValidAcTemperature(command.value))
+    {
+      completeCommand(command, "invalid_temperature", "Invalid AC temperature");
+      return;
+    }
+
+    setAirConditionerTemperature(command.value);
+    result = String("ac_temperature_") + smartHomeState.acSetTemperature;
+  }
+  else if (command.action == "temperature_up")
+  {
+    setAirConditionerTemperature(smartHomeState.acSetTemperature + 1);
+    result = String("ac_temperature_") + smartHomeState.acSetTemperature;
+  }
+  else if (command.action == "temperature_down")
+  {
+    setAirConditionerTemperature(smartHomeState.acSetTemperature - 1);
+    result = String("ac_temperature_") + smartHomeState.acSetTemperature;
+  }
+  else
+  {
+    completeCommand(command, "unsupported_action", "Unsupported AC action");
+    return;
+  }
+
+  rememberCommandExecution(command);
+  notifyCommandSuccess(command);
+  completeCommand(command, result, "Air conditioner command executed");
+}
+
+void dispatchV2DeviceCommand(const SmartHomeCommand &command)
+{
+  if (command.device == V2_LIVING_LIGHT_DEVICE_ID ||
+      command.device == V2_BEDROOM_LIGHT_DEVICE_ID)
+  {
+    dispatchV2LightCommand(command);
+    return;
+  }
+
+  if (command.device == V2_AIR_CONDITIONER_DEVICE_ID)
+  {
+    dispatchV2AirConditionerCommand(command);
+    return;
+  }
+
+  completeCommand(command, "unsupported_device", "Unsupported V2 device");
+}
+
+bool isDuplicateCommand(const SmartHomeCommand &command)
+{
+  return command.requiresRemoteAck &&
+         command.commandId != "" &&
+         (command.commandId == lastExecutedCommandId ||
+          (pendingDoneRetry && command.commandId == pendingDoneCommandId));
+}
+
+void rememberCommandExecution(const SmartHomeCommand &command)
+{
+  if (command.requiresRemoteAck && command.commandId != "")
+  {
+    lastExecutedCommandId = command.commandId;
+  }
+  smartHomeState.lastCommandAt = millis();
+}
+
+void completeCommand(const SmartHomeCommand &command, const String &result, const String &message)
+{
+  if (command.requiresRemoteAck)
+  {
+    markCommandDone(command.commandId, result, message);
+    return;
+  }
+
+  Serial.print("Local command complete: ");
+  Serial.print(command.commandId);
+  Serial.print(" result=");
+  Serial.println(result);
+}
+
+void notifyCommandSuccess(const SmartHomeCommand &command)
+{
+  smartHomeFeedback.notifyCommandSuccess(command.source == "touch");
+}
+
+void dispatchCommand(const SmartHomeCommand &command)
 {
   Serial.print("Processing command: ");
-  Serial.print(commandId);
+  Serial.print(command.commandId);
   Serial.print(" type=");
-  Serial.print(type);
+  Serial.print(command.type);
   Serial.print(" device=");
-  Serial.print(device);
+  Serial.print(command.device);
   Serial.print(" action=");
-  Serial.println(action);
+  Serial.println(command.action);
 
-  if (type == "device_control")
+  if (isDuplicateCommand(command))
   {
-    if (device != LIGHT_DEVICE_ID)
+    Serial.println("Duplicate command id skipped");
+    if (pendingDoneRetry && command.commandId == pendingDoneCommandId)
+    {
+      retryPendingCommandDone(millis());
+      return;
+    }
+    completeCommand(command, "duplicate_command", "Duplicate command skipped");
+    return;
+  }
+
+  if (command.type == "device_control")
+  {
+    if (isV2DeviceId(command.device))
+    {
+      dispatchV2DeviceCommand(command);
+      return;
+    }
+
+    if (command.device != LIGHT_DEVICE_ID)
     {
       Serial.println("Unsupported device");
-      markCommandDone(commandId, "unsupported_device", "Unsupported device");
+      completeCommand(command, "unsupported_device", "Unsupported device");
       return;
     }
 
     String result;
 
-    if (action == "on")
+    if (command.action == "on")
     {
-      lightIsOn = true;
-      digitalWrite(LED_PIN, HIGH);
+      setLivingLightState(true);
       result = "light_on";
       Serial.println("LED turned on");
     }
-    else if (action == "off")
+    else if (command.action == "off")
     {
-      lightIsOn = false;
-      digitalWrite(LED_PIN, LOW);
+      setLivingLightState(false);
       result = "light_off";
       Serial.println("LED turned off");
     }
-    else if (action == "toggle")
+    else if (command.action == "toggle")
     {
-      lightIsOn = !lightIsOn;
-      digitalWrite(LED_PIN, lightIsOn ? HIGH : LOW);
+      setLivingLightState(!smartHomeState.livingLight);
       result = lightIsOn ? "light_on" : "light_off";
       Serial.println(lightIsOn ? "LED toggled on" : "LED toggled off");
     }
     else
     {
       Serial.println("Unsupported action");
-      markCommandDone(commandId, "unsupported_action", "Unsupported light action");
+      completeCommand(command, "unsupported_action", "Unsupported light action");
       return;
     }
 
-    updateDeviceStatus(device, lightIsOn ? "on" : "off");
-    markCommandDone(commandId, result, "Light command executed");
+    updateDeviceStatus(command.device, smartHomeState.livingLight ? "on" : "off");
+    rememberCommandExecution(command);
+    notifyCommandSuccess(command);
+    completeCommand(command, result, "Light command executed");
     return;
   }
 
-  if (type == "ir_learn")
+  if (command.type == "ir_learn")
   {
-    if (device != IR_HUB_DEVICE_ID)
+    if (command.device != IR_HUB_DEVICE_ID)
     {
-      markCommandDone(commandId, "unsupported_device", "Unsupported IR hub device");
+      completeCommand(command, "unsupported_device", "Unsupported IR hub device");
       return;
     }
 
-    if (action != "start")
+    if (command.action != "start")
     {
-      markCommandDone(commandId, "unsupported_action", "Unsupported IR learn action");
+      completeCommand(command, "unsupported_action", "Unsupported IR learn action");
       return;
     }
 
-    if (key == "")
+    if (command.key == "")
     {
-      markCommandDone(commandId, "missing_ir_key", "Missing IR command key");
+      completeCommand(command, "missing_ir_key", "Missing IR command key");
       return;
     }
 
-    startIRLearnMode(commandId, key, name, category, description);
+    startIRLearnMode(
+        command.commandId,
+        command.key,
+        command.name,
+        command.category,
+        command.description);
+    rememberCommandExecution(command);
     return;
   }
 
-  if (type == "ir_send")
+  if (command.type == "ir_send")
   {
-    if (device != IR_HUB_DEVICE_ID)
+    if (command.device != IR_HUB_DEVICE_ID)
     {
-      markCommandDone(commandId, "unsupported_device", "Unsupported IR hub device");
+      completeCommand(command, "unsupported_device", "Unsupported IR hub device");
       return;
     }
 
-    if (action != "send")
+    if (command.action != "send")
     {
-      markCommandDone(commandId, "unsupported_action", "Unsupported IR send action");
+      completeCommand(command, "unsupported_action", "Unsupported IR send action");
       return;
     }
 
-    String resolvedKey = irCommandId;
+    String resolvedKey = command.irCommandId;
     if (resolvedKey == "")
     {
-      resolvedKey = key;
+      resolvedKey = command.key;
     }
 
     if (resolvedKey == "")
     {
-      markCommandDone(commandId, "missing_ir_key", "Missing IR command key");
+      completeCommand(command, "missing_ir_key", "Missing IR command key");
       return;
     }
 
-    sendSavedIRCommand(commandId, resolvedKey);
+    if (sendSavedIRCommand(command.commandId, resolvedKey))
+    {
+      rememberCommandExecution(command);
+      applyIrStateHint(resolvedKey);
+      notifyCommandSuccess(command);
+    }
     return;
   }
 
   Serial.println("Unsupported command type");
-  markCommandDone(commandId, "unsupported_type", "Unsupported command type");
+  completeCommand(command, "unsupported_type", "Unsupported command type");
 }
 
 void checkPendingCommand()
 {
+  if (!isWifiReadyForBridge())
+  {
+    return;
+  }
+
   Serial.println("Checking pending command");
 
   String path = String("/api/smart-home/commands/next?deviceId=") + SMART_HOME_DEVICE_ID;
   String payload = httpGetBridge(path);
+  if (payload == "")
+  {
+    return;
+  }
 
   StaticJsonDocument<1024> doc;
   DeserializationError error = deserializeJson(doc, payload);
@@ -849,26 +1666,89 @@ void checkPendingCommand()
   }
 
   JsonObject command = doc["command"].as<JsonObject>();
-  String commandId = command["id"] | "";
-  String type = command["type"] | "";
-  String device = command["device"] | "";
-  String action = command["action"] | "";
-  String irCommandId = command["irCommandId"] | "";
-  String key = command["key"] | "";
-  String name = command["name"] | "";
-  String category = command["category"] | "";
-  String description = command["description"] | "";
+  SmartHomeCommand normalizedCommand;
+  normalizedCommand.commandId = command["id"] | "";
+  if (normalizedCommand.commandId == "")
+  {
+    normalizedCommand.commandId = command["commandId"] | "";
+  }
+  normalizedCommand.source = command["source"] | "";
+  normalizedCommand.type = command["type"] | "";
+  normalizedCommand.device = command["device"] | "";
+  normalizedCommand.action = command["action"] | "";
+  normalizedCommand.irCommandId = command["irCommandId"] | "";
+  normalizedCommand.key = command["key"] | "";
+  normalizedCommand.name = command["name"] | "";
+  normalizedCommand.category = command["category"] | "";
+  normalizedCommand.description = command["description"] | "";
+  JsonVariant value = command["value"];
+  if (!value.isNull())
+  {
+    normalizedCommand.hasValue = value.is<int>() ||
+                                 value.is<long>() ||
+                                 value.is<float>() ||
+                                 value.is<double>();
+    if (normalizedCommand.hasValue)
+    {
+      normalizedCommand.value = value.as<int>();
+    }
+  }
 
-  if (commandId == "")
+  if (normalizedCommand.commandId == "")
   {
     Serial.println("Command response missing id");
     return;
   }
 
   Serial.print("Received command id: ");
-  Serial.println(commandId);
+  Serial.println(normalizedCommand.commandId);
 
-  processCommand(commandId, type, device, action, irCommandId, key, name, category, description);
+  dispatchCommand(normalizedCommand);
+}
+
+SmartHomeCommand createTouchCommand(const SmartHomeTouchEvent &event)
+{
+  localTouchCommandSequence++;
+
+  SmartHomeCommand command;
+  command.commandId = String("touch_") + localTouchCommandSequence + "_" + millis();
+  command.source = "touch";
+  command.type = "device_control";
+  command.device = event.device;
+  command.action = event.action;
+  command.requiresRemoteAck = false;
+  return command;
+}
+
+void handleTouchEvent(const SmartHomeTouchEvent &event)
+{
+  if (event.type == TOUCH_EVENT_NAVIGATION)
+  {
+    smartHomeDisplay.setPage(event.page);
+    smartHomeFeedback.notifyNavigation();
+    return;
+  }
+
+  if (event.type != TOUCH_EVENT_COMMAND)
+  {
+    return;
+  }
+
+  SmartHomeCommand command = createTouchCommand(event);
+  Serial.print("Touch command: ");
+  Serial.print(command.device);
+  Serial.print(" ");
+  Serial.println(command.action);
+  dispatchCommand(command);
+}
+
+void updateSmartHomeTouch(unsigned long now)
+{
+  SmartHomeTouchEvent event;
+  if (smartHomeTouch.update(now, smartHomeDisplay.page(), &event))
+  {
+    handleTouchEvent(event);
+  }
 }
 
 void setup()
@@ -876,25 +1756,49 @@ void setup()
   Serial.begin(115200);
   delay(1000);
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  smartHomeFeedback.begin();
+  smartHomeDisplay.begin();
+  smartHomeDisplay.showBootStatus("Wi-Fi", "...");
+  smartHomeDisplay.showBootStatus("BME280", "...");
+  smartHomeDisplay.showBootStatus("System", "...");
+
+  smartHomeState.livingLight = false;
+  smartHomeState.bedroomLight = false;
+  smartHomeState.acPower = false;
+  smartHomeState.acSetTemperature = 26;
+  lightIsOn = false;
+  setupDeviceOutputs();
   setupIR();
+  smartHomeTouch.begin();
+  smartHomeDisplay.showBootStatus("System", "OK");
+  setupBME280();
+  smartHomeDisplay.showBootStatus("BME280", smartHomeState.bme280Available ? "OK" : "NOT FOUND");
 
   Serial.println("TsunagariCare Smart Home Bridge Demo");
+  logDemoOutputConfiguration();
   connectWiFi();
-  updateDeviceStatus(LIGHT_DEVICE_ID, "off");
-  updateDeviceStatus(IR_HUB_DEVICE_ID, "online");
+  smartHomeDisplay.showBootStatus("Wi-Fi", "CONNECTING");
+  smartHomeDisplay.update(millis(), smartHomeState);
 }
 
 void loop()
 {
   unsigned long now = millis();
 
+  updateNetworkState();
   handleIRLearnMode();
+  updateBME280(now);
+  syncSmartHomeEnvironmentStatus(now);
+  syncInitialDeviceStatus(now);
+  retryPendingCommandDone(now);
+  updateSmartHomeTouch(now);
 
   if (!irLearnMode && now - lastCheckAt >= CHECK_INTERVAL_MS)
   {
     lastCheckAt = now;
     checkPendingCommand();
   }
+
+  smartHomeFeedback.update(now, smartHomeState);
+  smartHomeDisplay.update(now, smartHomeState);
 }

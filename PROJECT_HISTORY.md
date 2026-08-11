@@ -1,3 +1,1476 @@
+# 2026-08-12 01:53:35 +09:00 - Smart Home V2 Dashboard Sensor Sync Display Guard
+
+## Goal
+
+Tightened the Smart Home V2 Dashboard sensor sync so `devices/smart_home_001`
+is used as the indoor BME280 environment source without being rendered as a
+controllable Smart Home device card/list item.
+
+## Reason
+
+The sensor sync intentionally stores BME280 data at
+`devices/smart_home_001/environment`. That node represents the Smart Home
+Bridge/environment state, not a user-toggleable appliance. Rendering it in the
+existing Smart Home device list could increase the device count and create a
+generic toggle button that does not map to a real V2 control.
+
+## Files Changed
+
+- `tsunagari-care/src/js/dashboard.js`
+- `PROJECT_HISTORY.md`
+
+## Change
+
+- Added `latestSmartHomeBridgeDevice` to preserve the raw
+  `devices/smart_home_001` state for indoor environment rendering.
+- Added `isSmartHomeBridgeDevice(...)`.
+- Updated `getRoomEnvironment()` to read BME280 data from
+  `latestSmartHomeBridgeDevice`.
+- Updated `getSmartHomeDevicesForDisplay(...)` to exclude
+  `devices/smart_home_001` from the controllable device list.
+- Updated the active `updateDevicesSection = function (...)` override to set
+  `latestSmartHomeBridgeDevice` from the raw devices snapshot before rendering
+  the filtered device list.
+
+## Preserved Behavior
+
+- The Dashboard still prioritizes:
+  1. Smart Home V2 BME280 from `devices/smart_home_001/environment`
+  2. existing demo room environment fallback
+  3. existing placeholder formatting
+- Outdoor weather remains on `/api/weather/current`.
+- Chami card, Fall Detection, Alert Center, health logic, auth, server API,
+  Firebase paths, ESP32 firmware, and Smart Home command behavior were not
+  changed in this guard pass.
+
+## Checks
+
+- `node --check tsunagari-care/src/js/dashboard.js`: passed.
+- `node --check server/routes/smartHome.js`: passed.
+- Brace counts matched for firmware `.ino`, Dashboard JS, and smartHome server
+  route.
+- `git diff --check` passed for the sensor-sync files with normal Windows CRLF
+  warnings.
+- Firmware compile was not completed because `pio` and `arduino-cli` are not
+  available in PATH.
+
+# 2026-08-10 02:14:00 +09:00 - Smart Home V2 Dashboard Sensor Sync
+
+## Goal
+
+Updated the Dashboard indoor environment source priority so it can display real
+Smart Home V2 BME280 values from the ESP32 while preserving the existing demo
+fallback and without changing outdoor weather, Chami, Fall Detection, Alert
+Center, auth, or Smart Home command behavior.
+
+## Audit Before Change
+
+Current Dashboard indoor flow before this change:
+
+- Source: `ROOM_ENVIRONMENT_DEMO`
+- Frontend variable/function: `getRoomEnvironment()`
+- UI elements:
+  - `#room-temperature-text`
+  - `#room-humidity-text`
+  - `#room-demo-badge`
+- Values before change:
+  - `25°C`
+  - `湿度 50%`
+  - demo badge
+
+Outdoor weather flow before and after this change:
+
+- Source/API: Bridge API `GET /api/weather/current`
+- Frontend state: `latestWeatherState`
+- UI elements:
+  - `#outdoor-weather-tile`
+  - `#outdoor-weather-icon`
+  - `#outdoor-temperature-text`
+  - `#outdoor-weather-detail`
+- This flow was not changed.
+
+Smart Home BME280 audit:
+
+- Firmware had local `SmartHomeState` fields:
+  - `roomTemperature`
+  - `humidity`
+  - `pressure`
+  - `bme280Available`
+- TFT rendered those local fields correctly.
+- Firmware did not previously sync those BME280 fields to cloud.
+- Existing backend status endpoint was `POST /api/smart-home/device-status`.
+- Existing Firebase path was `devices/{deviceId}`.
+- Existing status endpoint only wrote:
+  - `id`
+  - `name`
+  - `type`
+  - `status`
+  - `source`
+  - `updatedAt`
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/TsunagariCare_SmartHome_Bridge_Demo.ino`
+- `server/routes/smartHome.js`
+- `tsunagari-care/src/js/dashboard.js`
+- `PROJECT_HISTORY.md`
+
+## New Smart Home Sensor Cloud Path
+
+Reused the existing device status endpoint and Firebase device path:
+
+- API: `POST /api/smart-home/device-status`
+- Firebase: `devices/smart_home_001/environment`
+
+Expected nested optional shape:
+
+```json
+{
+  "deviceId": "smart_home_001",
+  "name": "Smart Home Bridge",
+  "type": "smart_home",
+  "status": "online",
+  "source": "smart_home_001",
+  "environment": {
+    "sensorAvailable": true,
+    "temperature": 27.4,
+    "humidity": 46,
+    "pressure": 1000
+  }
+}
+```
+
+Server stores `environment.updatedAt` with a Firebase server timestamp.
+
+## ESP32 Sync
+
+- Added a 10 second `ENVIRONMENT_STATUS_SYNC_INTERVAL_MS`.
+- Added `updateSmartHomeEnvironmentStatus()`.
+- Added `syncSmartHomeEnvironmentStatus(now)`.
+- Sync runs after local `updateBME280(now)` and before existing status/command
+  retry work.
+- Uses the existing `httpPostBridgeStatus()` path.
+- Does not create a new endpoint or a new polling loop.
+- Does not send every loop.
+- Sends `sensorAvailable=false` when BME280 is unavailable.
+- Sends temperature/humidity/pressure only when readings are finite and valid.
+- Does not send NaN.
+
+## Server Compatibility
+
+- `environment` is optional.
+- Old `/device-status` payloads without `environment` remain valid.
+- Existing required fields stay unchanged:
+  - `deviceId`
+  - `status`
+- Added optional validation only when `environment` is present.
+- If `sensorAvailable=true`, temperature and humidity must be finite.
+- Pressure is optional.
+- If `sensorAvailable=false`, server stores only availability and timestamp.
+
+## Dashboard Source Priority
+
+Dashboard indoor environment now resolves:
+
+1. Real Smart Home V2 BME280 from `devices/smart_home_001/environment`
+2. Existing `ROOM_ENVIRONMENT_DEMO` fallback
+3. Placeholder formatting from existing formatters if values are unavailable
+
+The indoor tile updates when the devices subscription updates.
+
+## Indoor vs Outdoor Separation
+
+- Indoor tile can use Smart Home BME280.
+- Outdoor Tokyo weather remains on `/api/weather/current`.
+- No outdoor weather code path or API source was changed.
+
+## Fallback Behavior
+
+- If Smart Home environment is missing, unavailable, invalid, or stale, the
+  Dashboard falls back to the existing demo room environment.
+- Demo fallback remains visibly marked by the existing demo badge.
+- Real BME280 values use `BME280` in the same badge position.
+- Pressure is appended to the indoor detail text when present.
+
+## Tests
+
+- `node --check tsunagari-care/src/js/dashboard.js`: passed.
+- `node --check server/routes/smartHome.js`: passed.
+- Brace counts matched for:
+  - firmware `.ino`
+  - Dashboard JS
+  - smartHome server route
+- `git diff --check` passed for changed files with normal Windows CRLF warnings.
+- Firmware compile was not run because `pio` and `arduino-cli` are not
+  available in PATH.
+
+## Limitations
+
+- Real end-to-end verification still requires deploying/restarting the Bridge
+  API and uploading the ESP32 firmware.
+- Dashboard freshness threshold is currently a small frontend guard and may need
+  tuning after observing real device update intervals on Render/Firebase.
+- No Firebase data migration was performed.
+
+# 2026-08-09 02:23:12 +09:00 - Smart Home V2 TFT UI Polish
+
+## Goal
+
+Refined only the Smart Home V2 TFT visual rendering for the real ILI9341
+landscape 320x240 display. This pass is UI polish only and does not change
+server, Firebase, Dashboard, Chami, GPIO, BME280 logic, touch calibration,
+dispatcher, command flow, device state logic, WS2812 feedback, buzzer feedback,
+or Smart Home feature behavior.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeDisplay.cpp`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeDisplay.h`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeUiLayout.h`
+- `PROJECT_HISTORY.md`
+
+## HOME Page Polish
+
+- Reworked the top header to be cleaner and less crowded.
+- Kept the network pill on the right with Wi-Fi label, status dot, and
+  semantic status text.
+- Reworked device card drawing:
+  - title is fixed near the top-left of each card
+  - icons sit in their own visual area
+  - ON/OFF state is separated from the icon
+  - AC icon, power state, set temperature, and +/- controls no longer occupy
+    the same vertical text area
+- Reduced bulb and AC icon size so icons do not collide with card labels.
+- Reworked the environment bar into three clearer columns:
+  - Room Temp
+  - Humidity
+  - Pressure
+- Kept clean placeholders through the existing value formatters:
+  - `--.- C`
+  - `--%`
+  - `--- hPa`
+- Reworked bottom navigation with a shared rounded container, subtle dividers,
+  and a clearer active tab treatment.
+
+## DEVICES Page Polish
+
+- Reworked the DEVICES page into one consistent row panel.
+- Rows now share label/value alignment and divider styling.
+- State values use semantic colors:
+  - ON uses success green
+  - OFF uses inactive gray
+- Sensor values keep neutral readable text color.
+- Displayed rows remain:
+  - Living Light
+  - Bedroom Light
+  - Air Conditioner
+  - AC Set
+  - Room Temp
+  - Humidity
+
+## SYSTEM Page Polish
+
+- Reworked the SYSTEM page into the same consistent row panel style.
+- Rows now share label/value alignment and semantic colors.
+- Displayed rows remain:
+  - Wi-Fi
+  - Server
+  - BME280
+  - ESP32
+  - Uptime
+  - RSSI
+  - Last cmd
+
+## Layout And Hitboxes
+
+- Added shared UI spacing constants in `SmartHomeUiLayout.h`.
+- Kept the main card and navigation hitboxes shared between display and touch.
+- Updated AC +/- button rectangles to match their polished visual button
+  positions.
+- Updated AC power area height to avoid overlap with the +/- controls.
+- No touch behavior logic was changed.
+
+## Partial Redraw
+
+- Preserved the existing partial redraw architecture.
+- Full-screen drawing remains limited to boot/static page redraw.
+- Runtime updates still redraw only the relevant header, card, environment, or
+  row panel regions when cached state changes.
+- No `delay()` was added.
+
+## Checks
+
+- `git diff --check` passed for the UI files.
+- Brace counts matched for `SmartHomeDisplay.cpp`, `SmartHomeDisplay.h`, and
+  `SmartHomeUiLayout.h`.
+- Static search confirmed no `delay()` was added to the UI files.
+- Static search confirmed `fillScreen()` remains limited to boot/static frame
+  paths, not continuous loop redraw.
+- Real compile was not completed in this environment because neither `pio` nor
+  `arduino-cli` is available in PATH.
+
+## Hardware Follow-up
+
+- Check on the real TFT whether the pressure text still needs a shorter label
+  or smaller value treatment.
+- Check whether active card border contrast is bright enough under classroom
+  lighting.
+- Check whether the AC state/value row is comfortable with both `ON` and `OFF`
+  strings after touch testing.
+
+# 2026-08-09 02:13:02 +09:00 - Smart Home V2 Touch Calibration Orientation Fix
+
+## Goal
+
+Adjusted only the Smart Home V2 resistive touch calibration/orientation after
+real hardware testing showed the TFT was correct in landscape 320x240 but touch
+coordinates were mirrored horizontally and vertically.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/config.h`
+- `TsunagariCare_SmartHome_Bridge_Demo/config.example.h`
+- `PROJECT_HISTORY.md`
+
+## Calibration Change
+
+- Kept raw calibration range unchanged:
+  - `TOUCH_MIN_X = 200`
+  - `TOUCH_MAX_X = 3900`
+  - `TOUCH_MIN_Y = 200`
+  - `TOUCH_MAX_Y = 3900`
+- Kept axis swap disabled:
+  - `TOUCH_SWAP_XY = 0`
+- Enabled both axis inversion based on observed hardware symptoms:
+  - `TOUCH_INVERT_X = 1`
+  - `TOUCH_INVERT_Y = 1`
+- Enabled touch debug logs for the next five-point calibration pass:
+  - `SMART_HOME_TOUCH_DEBUG = 1`
+
+## Preserved Scope
+
+- No UI layout, hitbox, device logic, dispatcher, TFT layout, server, Firebase,
+  Dashboard, Chami, GPIO pin map, or shared SPI pin change was made.
+- TFT CS remains GPIO5.
+- Touch CS remains GPIO32.
+- Touch IRQ remains GPIO35.
+- SPI remains SCK GPIO18, MOSI GPIO23, MISO GPIO19.
+
+## Debug Log Audit
+
+`SmartHomeTouch::logPoint()` is called only after `touch_.touched()` is true and
+the raw pressure is at least `TOUCH_MIN_PRESSURE`, so debug serial output is
+emitted only during real touch reads.
+
+## Five-point Calibration Procedure
+
+Tap in this order and record `rawX`, `rawY`, `mappedX`, `mappedY`, and `z`:
+
+1. TOP-LEFT
+2. TOP-RIGHT
+3. BOTTOM-LEFT
+4. BOTTOM-RIGHT
+5. CENTER
+
+Expected mapped targets:
+
+- TOP-LEFT approximately `(0,0)`
+- TOP-RIGHT approximately `(319,0)`
+- BOTTOM-LEFT approximately `(0,239)`
+- BOTTOM-RIGHT approximately `(319,239)`
+- CENTER approximately `(160,120)`
+
+If the mapped points still miss, update only the calibration macros in
+`config.h` and `config.example.h`; do not move UI hitboxes to compensate.
+
+## Compile Result
+
+- Real compile was not completed in this environment because neither `pio` nor
+  `arduino-cli` is available in PATH.
+- No firmware source logic change was made, and no delay was added.
+
+# 2026-08-08 22:54:03 +09:00 - Smart Home V2 Phase 6.8 Hardware Bring-up
+
+## Goal
+
+Prepared the current Smart Home V2 firmware for reproducible compile/upload
+and real hardware bring-up. This phase does not add Smart Home features and
+does not modify server, Dashboard, Chami, Firebase, API behavior, command
+format, device list, or legacy IR logic.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/platformio.ini`
+- `docs/SMART_HOME_V2_HARDWARE_BRINGUP.md`
+- `PROJECT_HISTORY.md`
+
+## Build Environment
+
+- Added a minimal PlatformIO build manifest in the firmware directory.
+- Environment:
+  - `platform = espressif32`
+  - `board = esp32dev`
+  - `framework = arduino`
+  - `monitor_speed = 115200`
+- Project source directory:
+  - `src_dir = .`
+- This keeps the existing Arduino firmware structure and does not change
+  framework.
+
+## Required Libraries
+
+Pinned in `platformio.ini`:
+
+- `bblanchon/ArduinoJson @ ^6.21.5`
+- `crankyoldgit/IRremoteESP8266 @ ^2.8.6`
+- `adafruit/Adafruit GFX Library @ ^1.11.9`
+- `adafruit/Adafruit ILI9341 @ ^1.6.1`
+- `adafruit/Adafruit BusIO @ ^1.16.1`
+- `adafruit/Adafruit BME280 Library @ ^2.2.4`
+- `adafruit/Adafruit Unified Sensor @ ^1.1.14`
+- `paulstoffregen/XPT2046_Touchscreen @ ^1.4`
+- `adafruit/Adafruit NeoPixel @ ^1.12.3`
+
+## Compile Result
+
+- Real compile was not completed in this environment because neither
+  `arduino-cli` nor `pio` is available in PATH.
+- No firmware source compile fixes were made in this phase.
+- The smallest reproducible next step is to run:
+  `pio run -d TsunagariCare_SmartHome_Bridge_Demo`
+  on a machine with PlatformIO installed.
+
+## Local Config Audit
+
+The existing local `config.h` is older than `config.example.h` and is missing
+the newer hardware macros. Secrets were not printed.
+
+Missing local hardware macros:
+
+- `SMART_HOME_DEMO_MODE`
+- TFT pins: `TFT_SCK_PIN`, `TFT_MOSI_PIN`, `TFT_MISO_PIN`, `TFT_CS_PIN`,
+  `TFT_DC_PIN`, `TFT_RST_PIN`
+- touch pins/calibration: `TOUCH_CS_PIN`, `TOUCH_IRQ_PIN`, `TOUCH_MIN_X`,
+  `TOUCH_MAX_X`, `TOUCH_MIN_Y`, `TOUCH_MAX_Y`, `TOUCH_SWAP_XY`,
+  `TOUCH_INVERT_X`, `TOUCH_INVERT_Y`, `TOUCH_MIN_PRESSURE`,
+  `TOUCH_DEBOUNCE_MS`, `SMART_HOME_TOUCH_DEBUG`
+- BME280 pins: `BME280_SDA_PIN`, `BME280_SCL_PIN`
+- demo LEDs: `DEMO_LIVING_LED_PIN`, `DEMO_BEDROOM_LED_PIN`,
+  `DEMO_AC_LED_PIN`
+- feedback: `SYSTEM_WS2812_PIN`, `SYSTEM_LED_BRIGHTNESS`,
+  `SYSTEM_ACTIVITY_MS`, `BUZZER_PIN`, `BUZZER_CONFIRM_MS`,
+  `BUZZER_NAV_MS`, `BUZZER_ACTIVE_TYPE`, `BUZZER_PASSIVE_FREQUENCY`
+
+Firmware still has fallback guards for these macros, but hardware bring-up
+should copy the explicit hardware macro block from `config.example.h` into
+local `config.h` before upload.
+
+## Startup Self-test Log Audit
+
+Current firmware already logs enough information for hardware bring-up:
+
+- feedback WS2812 pin, brightness, buzzer pin, and buzzer type
+- TFT init dimensions and landscape warning if not 320x240
+- touch CS/IRQ and calibration debug hint
+- BME280 I2C pins and detected 0x76/0x77 or not found
+- Wi-Fi connecting/connected/disconnected/retry and server reachability
+- demo mode and demo LED pins
+- IR RX/TX initialization
+
+No separate hardware test firmware or `SMART_HOME_HARDWARE_TEST_MODE` was added.
+
+## Hardware Test Checklist
+
+Added `docs/SMART_HOME_V2_HARDWARE_BRINGUP.md` with:
+
+- exact wiring checklist
+- safe test order from ESP32 boot through legacy IR
+- touch calibration procedure
+- demo mode setting
+- WS2812 verification
+- buzzer type verification
+- SPI shared-bus and GPIO5 boot checks
+- optional peripheral absence tests
+
+## Known Risks
+
+- `TFT_CS_PIN = GPIO5` is an ESP32 strapping pin. Hardware must prove that the
+  TFT module does not hold CS LOW during reset/power-on.
+- TFT and touch share SPI. Firmware sets both CS pins HIGH at touch init and
+  keeps TFT CS HIGH before touch reads, but hardware bring-up must still confirm
+  no CS contention on the real module.
+- Local `config.h` is missing explicit V2 hardware macros; defaults compile via
+  fallback guards, but real hardware tests require explicit local config values.
+- Buzzer type cannot be inferred from source; active/passive must be verified
+  on hardware.
+- WS2812 color order is currently `NEO_GRB`; color order changes should wait
+  for real hardware evidence.
+- Existing legacy IR send path still contains short blocking delays for IR
+  repeat/send behavior. This phase did not refactor legacy IR timing.
+
+# 2026-08-08 22:31:06 +09:00 - Smart Home V2 Phase 6.5 WS2812 And Buzzer Feedback
+
+## Goal
+
+Added physical system feedback for the Smart Home V2 firmware using one WS2812
+RGB LED and one buzzer. This phase does not modify server, Dashboard, Chami,
+Firebase schema, touch calibration, or Smart Home API behavior.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/TsunagariCare_SmartHome_Bridge_Demo.ino`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeFeedback.h`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeFeedback.cpp`
+- `TsunagariCare_SmartHome_Bridge_Demo/config.example.h`
+- `PROJECT_HISTORY.md`
+
+## Library
+
+- Added Adafruit NeoPixel for the single WS2812 system status LED.
+- Required additional Arduino library:
+  - Adafruit NeoPixel
+
+## Pins
+
+- Uses the locked Phase 3.5 master pin map:
+  - `SYSTEM_WS2812_PIN = 4`
+  - `BUZZER_PIN = 16`
+- No other GPIO assignment was changed.
+- Demo device LEDs remain unchanged:
+  - GPIO25 Living
+  - GPIO26 Bedroom
+  - GPIO13 AC
+
+## Config
+
+- Added configurable example macros:
+  - `SYSTEM_LED_BRIGHTNESS = 48`
+  - `SYSTEM_ACTIVITY_MS = 180`
+  - `BUZZER_CONFIRM_MS = 60`
+  - `BUZZER_NAV_MS = 30`
+  - `BUZZER_ACTIVE_TYPE = 1`
+  - `BUZZER_PASSIVE_FREQUENCY = 2400`
+- Firmware includes fallback guards for old local `config.h` files.
+- `BUZZER_ACTIVE_TYPE=1` uses GPIO HIGH/LOW for active buzzer modules.
+- `BUZZER_ACTIVE_TYPE=0` uses `tone()`/`noTone()` for passive buzzer modules.
+
+## System Color Mapping
+
+- Boot: dim cyan/blue.
+- Wi-Fi offline: red.
+- Wi-Fi connected and server offline/unreachable: yellow.
+- Wi-Fi connected and server reachable: green.
+- BME280 unavailable does not override connectivity status color.
+
+## Activity Feedback
+
+- Successful device/IR command execution starts a non-blocking blue WS2812
+  activity flash for `SYSTEM_ACTIVITY_MS`.
+- After the activity timer expires, the LED returns to the current system
+  connectivity color.
+- Invalid/rejected commands do not trigger confirmation feedback.
+- Duplicate remote commands skipped by dedupe do not trigger success feedback.
+
+## Buzzer Design
+
+- Added `SmartHomeFeedback` module with:
+  - `begin()`
+  - `update(now, state)`
+  - `notifyCommandSuccess(...)`
+  - `notifyNavigation()`
+- Confirmation beep defaults to 60 ms.
+- Navigation beep defaults to 30 ms.
+- Buzzer is timer-driven and non-blocking.
+- Future enum placeholders exist for confirm, warning, and emergency feedback,
+  but fall-alert/emergency integration was not implemented in this phase.
+
+## Command Integration
+
+- Successful V2 semantic device commands trigger command feedback.
+- Successful legacy light command triggers command feedback.
+- Successful IR send command triggers command feedback.
+- Touch commands and remote commands use the same success feedback path.
+- Navigation taps trigger only the short navigation beep.
+- No feedback is triggered by BME280 reads, network polling, reconnect attempts,
+  UI redraws, or invalid AC temperature commands.
+
+## Preserved Compatibility
+
+- No server, Dashboard, Chami/Xiaozhi, Firebase schema, microSD, new touch
+  calibration, Wi-Fi setup UI, or physical button changes were made.
+- Existing TFT, touch, partial redraw, BME280, demo LEDs, IR send/learn,
+  network resilience, remote dedupe, pending done retry, local/remote command
+  distinction, semantic commands, legacy commands, and GPIO map were preserved.
+
+## Checks
+
+- `git diff --check` passed with only normal Windows CRLF warnings.
+- Brace counts matched for the `.ino`, feedback, touch, and display files.
+- Static search confirmed feedback module has no `delay()`.
+- Static search confirmed GPIO4/16 are used for WS2812/buzzer.
+- Static search confirmed no duplicate non-negative GPIO pin macros.
+- Arduino CLI and PlatformIO were not available in this environment, so firmware
+  compile was not run here.
+
+## Limitations
+
+- Buzzer active/passive hardware type still needs confirmation on the actual
+  module. Change `BUZZER_ACTIVE_TYPE` in local `config.h` if needed.
+- WS2812 color order is set for the common `NEO_GRB + NEO_KHZ800` breakout and
+  should be verified on hardware.
+
+## Next Phase
+
+Recommended next phase: hardware bring-up and calibration pass for TFT, touch,
+BME280, WS2812, buzzer, and demo LEDs before adding cloud/dashboard extensions.
+
+# 2026-08-08 22:21:03 +09:00 - Smart Home V2 Phase 6 Touchscreen Interaction
+
+## Goal
+
+Added resistive touchscreen interaction for the ESP32 Smart Home TFT UI while
+preserving the existing Smart Home command/state architecture. Touch now drives
+local semantic commands through the shared dispatcher instead of mutating
+`SmartHomeState` directly.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/TsunagariCare_SmartHome_Bridge_Demo.ino`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeCommand.h`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeDisplay.h`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeDisplay.cpp`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeTouch.h`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeTouch.cpp`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeUiLayout.h`
+- `TsunagariCare_SmartHome_Bridge_Demo/config.example.h`
+- `PROJECT_HISTORY.md`
+
+## Touch Controller And Library
+
+- The TFT module touch pins `T_IRQ`, `T_DO`, `T_DIN`, `T_CS`, and `T_CLK` match
+  the common XPT2046-compatible resistive touch controller wiring.
+- Added `XPT2046_Touchscreen` as the selected touch library.
+- Required additional library:
+  - XPT2046_Touchscreen
+
+## SPI Sharing
+
+- Touch uses the same SPI bus as TFT:
+  - SCK GPIO18
+  - MOSI GPIO23
+  - MISO GPIO19
+- Chip selects remain separate:
+  - TFT CS GPIO5
+  - Touch CS GPIO32
+- Touch IRQ remains GPIO35, input-only.
+- Touch code sets TFT CS high before touch reads so TFT and touch are not active
+  on SPI at the same time.
+- microSD remains unused.
+
+## Calibration Model
+
+- Added editable calibration/example constants to `config.example.h`:
+  - `TOUCH_MIN_X`
+  - `TOUCH_MAX_X`
+  - `TOUCH_MIN_Y`
+  - `TOUCH_MAX_Y`
+  - `TOUCH_SWAP_XY`
+  - `TOUCH_INVERT_X`
+  - `TOUCH_INVERT_Y`
+  - `TOUCH_MIN_PRESSURE`
+  - `TOUCH_DEBOUNCE_MS`
+  - `SMART_HOME_TOUCH_DEBUG`
+- Firmware also has fallback guards so old local `config.h` files compile.
+- Defaults are safe examples, not final measured calibration values.
+- When `SMART_HOME_TOUCH_DEBUG=1`, the firmware logs raw X/Y, mapped X/Y, and
+  pressure only while touched.
+
+## Debounce Model
+
+- Touch triggers on the new-press edge.
+- Holding a finger down does not repeat toggles or temperature steps.
+- A release is required before the next tap can fire.
+- A configurable cooldown defaults to `TOUCH_DEBOUNCE_MS = 180`.
+
+## Touch Command Flow
+
+- Added `SmartHomeCommand::requiresRemoteAck`, defaulting to `true`.
+- Remote Firebase commands keep the existing ack/dedupe/done retry flow.
+- Local touch commands use:
+  - `source = "touch"`
+  - `type = "device_control"`
+  - semantic V2 device IDs
+  - `requiresRemoteAck = false`
+- Local touch commands call the same `dispatchCommand()` path and V2 execution
+  logic as remote commands.
+- Local touch commands do not call `/api/smart-home/commands/{id}/done` and do
+  not participate in remote pending done retry.
+
+## Hitboxes And Actions
+
+- Added shared `SmartHomeUiLayout.h` so display drawing and touch hit testing
+  use the same coordinates.
+- HOME page actions:
+  - Living card -> `living_light` / `toggle`
+  - Bedroom card -> `bedroom_light` / `toggle`
+  - AC power area -> `air_conditioner` / `toggle`
+  - AC minus button -> `air_conditioner` / `temperature_down`
+  - AC plus button -> `air_conditioner` / `temperature_up`
+- Bottom navigation actions:
+  - HOME -> `UI_HOME`
+  - DEVICES -> `UI_DEVICES`
+  - SYSTEM -> `UI_SYSTEM`
+- DEVICES and SYSTEM pages remain display-only except for bottom navigation.
+
+## Display Changes
+
+- AC card now draws large `-` and `+` buttons aligned with the touch hitboxes.
+- Added `SmartHomeDisplay::page()` so touch can hit-test the current page.
+- Added a non-blocking boot hold of about 1000 ms so the boot screen is visible
+  before HOME redraw. No new `delay()` was added.
+
+## Preserved Compatibility
+
+- No Dashboard, Chami/Xiaozhi, server, Firebase schema, buzzer, WS2812, microSD,
+  Wi-Fi setup UI, or physical button behavior was added.
+- Existing network resilience, BME280 interval/recovery, Demo Mode outputs, IR
+  send/learn, semantic devices, legacy mappings, remote dedupe, pending done
+  retry, and TFT partial redraw behavior were preserved.
+
+## Checks
+
+- `git diff --check` passed with only normal Windows CRLF warnings.
+- Brace counts matched for the `.ino`, display, touch, and layout files.
+- Static search confirmed touch code does not mutate `smartHomeState` directly.
+- Static search confirmed touch code does not call `/done` or `markCommandDone`.
+- Static search confirmed no touch/UI `delay()` was added.
+- Static search confirmed no touch/XPT2046 server, Dashboard, Chami, WS2812,
+  buzzer, or microSD integration was added.
+- Arduino CLI and PlatformIO were not available in this environment, so firmware
+  compile was not run here.
+
+## Hardware Calibration Procedure
+
+Enable `SMART_HOME_TOUCH_DEBUG=1` in local `config.h`, upload, and record raw
+coordinates for:
+
+- TOP-LEFT
+- TOP-RIGHT
+- BOTTOM-LEFT
+- BOTTOM-RIGHT
+- CENTER
+
+Then update local `TOUCH_MIN_X`, `TOUCH_MAX_X`, `TOUCH_MIN_Y`, `TOUCH_MAX_Y`,
+and swap/invert flags until landscape mapping matches top-left `(0,0)` and
+bottom-right `(319,239)`.
+
+## Limitations
+
+- Touch calibration values still require measurement on the actual display.
+- XPT2046-compatible controller is assumed from the module pin naming and must
+  be confirmed on hardware.
+- DEVICES rows are not touch controls in this phase.
+
+## Next Phase
+
+Recommended next phase: hardware calibration and polish, then optional system
+status feedback with WS2812/buzzer only after touch is verified.
+
+# 2026-08-08 22:08:12 +09:00 - Smart Home V2 Phase 5 TFT UI
+
+## Goal
+
+Integrated an ILI9341 2.8 inch TFT display-only Smart Home UI for the ESP32
+Smart Home Bridge firmware. This phase adds display rendering only and does not
+implement touch, XPT2046, physical buttons, buzzer behavior, WS2812 behavior,
+Dashboard changes, Chami/Xiaozhi changes, server changes, Firebase schema
+changes, or IR behavior changes.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/TsunagariCare_SmartHome_Bridge_Demo.ino`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeDisplay.h`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeDisplay.cpp`
+- `PROJECT_HISTORY.md`
+
+## TFT Library
+
+- Chosen library path:
+  - Adafruit GFX
+  - Adafruit ILI9341
+- This keeps all TFT pins explicit in firmware and avoids global `TFT_eSPI`
+  `User_Setup` changes.
+- Required Arduino libraries:
+  - Adafruit GFX Library
+  - Adafruit ILI9341
+  - Adafruit BusIO
+
+## TFT Pins And SPI
+
+- Uses the locked Phase 3.5 master pin map:
+  - `TFT_SCK_PIN = 18`
+  - `TFT_MOSI_PIN = 23`
+  - `TFT_MISO_PIN = 19`
+  - `TFT_CS_PIN = 5`
+  - `TFT_DC_PIN = 27`
+  - `TFT_RST_PIN = 14`
+- SPI is initialized with:
+  - `SPI.begin(TFT_SCK_PIN, TFT_MISO_PIN, TFT_MOSI_PIN, TFT_CS_PIN)`
+- Touch pins remain reserved but unused.
+- microSD remains unused.
+- No TFT backlight GPIO or PWM was added.
+
+## Orientation
+
+- Display rotation is set to `1`.
+- Firmware logs `tft.width()` and `tft.height()` after init.
+- If dimensions are not landscape `320x240`, firmware logs a warning.
+
+## UI Architecture
+
+- Added `SmartHomeDisplay` module with:
+  - `begin()`
+  - `showBootStatus(...)`
+  - `update(now, smartHomeState)`
+  - `setPage(...)`
+- Added display-only page enum:
+  - `UI_HOME`
+  - `UI_DEVICES`
+  - `UI_SYSTEM`
+- `SmartHomeState` remains the UI source of truth. No duplicate device/sensor
+  state was added for TFT.
+- Firmware loop now calls `smartHomeDisplay.update(now, smartHomeState)` after
+  network, IR, BME280, done retry, and command polling logic.
+
+## Pages
+
+- HOME:
+  - Header with TsunagariCare Smart Home title and network/cloud status.
+  - Three cards for Living, Bedroom, and AC.
+  - AC card shows power and set temperature.
+  - Environment bar shows room temperature, humidity, and pressure when BME280
+    is available.
+  - Bottom nav shows HOME active.
+- DEVICES:
+  - Display-only rows for Living Light, Bedroom Light, Air Conditioner, AC set
+    temperature, room temperature, and humidity.
+- SYSTEM:
+  - Display-only rows for Wi-Fi, server, BME280, ESP32, uptime, RSSI, and last
+    command age when available.
+
+## Partial Redraw Behavior
+
+- No full-screen redraw is called from `loop()`.
+- Full-screen draw happens only at boot or page/static-frame redraw.
+- HOME dynamic updates redraw only changed regions:
+  - header status
+  - living card
+  - bedroom card
+  - AC card
+  - environment bar
+- Sensor values are converted to display precision before cache comparison:
+  - temperature: 1 decimal
+  - humidity: whole percent
+  - pressure: whole hPa
+- Small BME280 float changes that do not change displayed values do not redraw
+  the environment bar.
+
+## BME280 Display Handling
+
+- Temperature displays as Celsius text.
+- Humidity displays as percent.
+- Pressure displays as hPa.
+- When BME280 is unavailable, UI renders placeholders:
+  - `--.- C`
+  - `--%`
+  - `--- hPa`
+- UI never renders `nan`.
+
+## Network Status Behavior
+
+- Wi-Fi disconnected renders `OFFLINE`.
+- Wi-Fi connected but server unreachable renders `CLOUD OFF`.
+- Wi-Fi connected and server reachable renders `ONLINE`.
+- TFT updates are local and do not depend on Internet availability.
+
+## Preserved Compatibility
+
+- No changes to command format, Firebase paths, server routes, Dashboard, or
+  Chami/Xiaozhi.
+- Existing Demo Mode, V2 semantic devices, legacy LED, IR send/learn,
+  `room_light_power`, `ac_cool_26`, `ac_off`, command polling, done retry,
+  Wi-Fi reconnect, HTTP timeout, BME280 read interval, and BME280 recovery were
+  preserved.
+
+## Checks
+
+- `git diff --check` passed with only normal Windows CRLF warnings.
+- Brace counts matched for the `.ino` and display `.cpp` files.
+- Static search confirmed no touch/XPT2046 code was added.
+- Static search confirmed no UI `delay()` was added.
+- Static search confirmed no full-screen redraw is called directly from loop.
+- Arduino CLI and PlatformIO were not available in this environment, so firmware
+  compile was not run here.
+
+## Limitations
+
+- TFT hardware orientation and visual layout still need board testing.
+- TFT init does not provide a reliable hardware detection result, so firmware
+  continues normal operation even if the screen is not visible.
+- Pages DEVICES and SYSTEM are implemented display-only but cannot be selected
+  by touch until Phase 6.
+
+## Next Phase
+
+Recommended next phase: touchscreen interaction using the reserved XPT2046 touch
+pins and the existing shared SPI bus.
+
+# 2026-08-08 21:56:07 +09:00 - Smart Home V2 Phase 4 BME280 Integration
+
+## Goal
+
+Integrated BME280 local sensor reading into the ESP32 Smart Home Bridge firmware
+using the locked Phase 3.5 I2C pins, without changing Firebase schema, server
+routes, Dashboard behavior, Chami/Xiaozhi behavior, command format, IR behavior,
+or TFT/touch code.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/TsunagariCare_SmartHome_Bridge_Demo.ino`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeState.h`
+- `PROJECT_HISTORY.md`
+
+## Libraries
+
+- Added Arduino includes for:
+  - `Wire.h`
+  - `Adafruit_Sensor.h`
+  - `Adafruit_BME280.h`
+- Required Arduino libraries:
+  - Adafruit BME280 Library
+  - Adafruit Unified Sensor
+
+## I2C Pins
+
+- Uses the locked Freenove ESP32 WROOM pin map:
+  - `BME280_SDA_PIN = 21`
+  - `BME280_SCL_PIN = 22`
+- Added fallback compile guards in the firmware so older local `config.h` files
+  without these macros still use the locked GPIO21/GPIO22 map.
+- BME280 is I2C only; SPI BME280 wiring was not added.
+
+## Address Detection
+
+- Boot flow calls `Wire.begin(BME280_SDA_PIN, BME280_SCL_PIN)`.
+- The firmware probes `0x76` first.
+- If `0x76` fails, it probes `0x77`.
+- If both fail, it logs `BME280: NOT FOUND`, keeps sensor values as `NAN`, and
+  continues running.
+- When available from the library, chip ID is checked against BME280 ID `0x60`.
+  Unexpected sensor/chip values are logged during boot probing.
+
+## SmartHomeState
+
+- Added `bool bme280Available = false`.
+- Existing fields remain:
+  - `roomTemperature`
+  - `humidity`
+  - `pressure`
+- On valid read:
+  - `roomTemperature` stores Celsius.
+  - `humidity` stores percent relative humidity.
+  - `pressure` stores hPa.
+- Sensor values are not rounded early; TFT/UI can format later.
+
+## Read Interval And Validation
+
+- BME280 read interval: 2000 ms.
+- Sensor reads run from `loop()` via `updateBME280(now)`.
+- No sensor delay or per-loop sensor read was added.
+- Readings update state only when:
+  - temperature is not `NAN`
+  - humidity is not `NAN` and within 0-100 percent
+  - pressure is not `NAN` and greater than zero hPa
+
+## Failure And Recovery
+
+- One invalid read does not clear the previous valid reading.
+- After 3 consecutive invalid reads, the firmware marks BME280 unavailable and
+  clears sensor readings back to `NAN`.
+- While unavailable, the firmware retries BME280 initialization every 10000 ms.
+- Recovery logs once when the sensor is detected again.
+- Wi-Fi/server availability does not affect local BME280 reads.
+
+## Preserved Compatibility
+
+- No Firebase schema or API change.
+- No new device was created.
+- No sensor data is sent to the server in this phase.
+- Existing command polling, done retry, non-blocking Wi-Fi, semantic V2 devices,
+  demo mode, legacy LED, IR send, IR learn, `room_light_power`, `ac_cool_26`,
+  and `ac_off` behavior were preserved.
+- GPIO master map from Phase 3.5 was not changed.
+
+## Checks
+
+- `git diff --check` passed with only normal Windows CRLF warnings.
+- Brace count matched in the firmware file.
+- Static search confirmed no sensor `delay()` was added.
+- Static search confirmed BME280 uses GPIO21/GPIO22 and I2C.
+- No duplicate pin macros were introduced.
+- Arduino CLI and PlatformIO were not available in this environment, so firmware
+  compile was not run here.
+
+## Limitations
+
+- Hardware BME280 detection and runtime reconnect behavior still need to be
+  verified on the Freenove ESP32 WROOM board.
+- The required Adafruit libraries must be installed in the Arduino/PlatformIO
+  environment before compiling.
+- Sensor state is local-only until a later integration phase defines a safe API
+  or dashboard contract.
+
+## Next Phase
+
+Recommended next phase: TFT ILI9341 UI, using the locked SPI pin map and local
+`SmartHomeState` values.
+
+# 2026-08-08 21:48:14 +09:00 - Smart Home V2 Phase 3.5 Hardware Master Pin Map
+
+## Goal
+
+Documented and reserved the hardware master pin map for the Smart Home V2 demo
+on a Freenove ESP32 WROOM board, without implementing new hardware drivers or
+changing Smart Home API, Firebase, server, Dashboard, Chami/Xiaozhi, or IR
+behavior.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/config.example.h`
+- `docs/SMART_HOME_V2_HARDWARE_PIN_MAP.md`
+- `PROJECT_HISTORY.md`
+
+## Hardware Identified
+
+- Freenove ESP32 WROOM board.
+- ILI9341 2.8 inch SPI TFT, planned landscape 320x240.
+- Resistive touch controller on the same display module.
+- BME280 module, reserved for I2C mode.
+- Three 5 mm demo LEDs:
+  - `living_light`
+  - `bedroom_light`
+  - `air_conditioner`
+- One WS2812 RGB breakout for system status.
+- One buzzer.
+- Existing IR TX/RX and legacy LED.
+
+## Final GPIO Mapping
+
+- Preserved current firmware pins:
+  - GPIO2 = `LED_PIN`
+  - GPIO17 = `IR_SEND_PIN`
+  - GPIO33 = `IR_RECEIVE_PIN`
+- Shared TFT/touch SPI:
+  - GPIO18 = `TFT_SCK_PIN`
+  - GPIO23 = `TFT_MOSI_PIN`
+  - GPIO19 = `TFT_MISO_PIN`
+- TFT control:
+  - GPIO5 = `TFT_CS_PIN`
+  - GPIO27 = `TFT_DC_PIN`
+  - GPIO14 = `TFT_RST_PIN`
+- Touch:
+  - GPIO32 = `TOUCH_CS_PIN`
+  - GPIO35 = `TOUCH_IRQ_PIN`
+- BME280 I2C:
+  - GPIO21 = `BME280_SDA_PIN`
+  - GPIO22 = `BME280_SCL_PIN`
+- Demo LEDs:
+  - GPIO25 = `DEMO_LIVING_LED_PIN`
+  - GPIO26 = `DEMO_BEDROOM_LED_PIN`
+  - GPIO13 = `DEMO_AC_LED_PIN`
+- Optional system outputs:
+  - GPIO4 = `SYSTEM_WS2812_PIN`
+  - GPIO16 = `BUZZER_PIN`
+
+## Selection Notes
+
+- GPIO18/23/19 are the normal VSPI-style signal pins and are suitable for a
+  shared TFT/touch SPI bus with separate chip selects.
+- GPIO21/22 are the normal I2C SDA/SCL pair and keep BME280 independent from
+  SPI, IR, and demo LED outputs.
+- GPIO25/26/13 are output-capable for simple LED simulation.
+- GPIO4 is output-capable and selected for one WS2812 data line.
+- GPIO16 is output-capable on ESP32 WROOM and selected for buzzer/PWM use.
+- GPIO35 is input-only, which is acceptable for touch IRQ only. It requires a
+  module or external pull-up because GPIO34-GPIO39 do not provide software
+  pull-up/down.
+- GPIO6-GPIO11 are reserved flash pins and remain unused.
+- GPIO34-GPIO39 are not used for outputs.
+
+## Reserved And Intentionally Unused
+
+- microSD pins on the TFT module remain unused in this phase.
+- No GPIO is reserved for TFT backlight yet. Prefer wiring TFT LED/backlight to
+  the module-supported power rail if safe; add a PWM pin later only if needed.
+- No physical button pin was assigned in this phase.
+
+## Risks
+
+- GPIO2 is an ESP32 strapping pin but is already the legacy LED pin and was
+  preserved.
+- GPIO5 is an ESP32 strapping pin and is used as TFT CS. The TFT module must not
+  hold CS low during boot; idle high or pull-up is preferred.
+- GPIO16/17 can conflict with PSRAM on some ESP32 variants, but the target board
+  for this phase is ESP32 WROOM and GPIO17 is already working as IR TX.
+- Touch IRQ on GPIO35 is input-only and cannot use internal pull-up/down.
+
+## Checks
+
+- No duplicate GPIO assignment in the master map.
+- No output assigned to GPIO34-GPIO39.
+- Existing GPIO2/17/33 preserved.
+- TFT and touch share SCK/MOSI/MISO and use separate CS pins.
+- BME280 uses I2C only.
+- WS2812 and buzzer selected pins are output-capable on ESP32 WROOM.
+- microSD remains unused.
+- `config.example.h` contains all planned pin constants.
+
+## Next Phase
+
+Recommended next phase: BME280 integration using GPIO21/GPIO22 with interval
+reads and no blocking loop.
+
+# 2026-08-08 21:27:16 +09:00 - Smart Home V2 Phase 3 Demo Mode And Physical Outputs
+
+## Goal
+
+Implemented Smart Home V2 Phase 3 for the ESP32 Smart Home Bridge firmware:
+semantic demo devices, optional physical LED outputs, and AC temperature state,
+while keeping existing API, Firebase paths, IR behavior, and Phase 2 network
+resilience intact.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/TsunagariCare_SmartHome_Bridge_Demo.ino`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeCommand.h`
+- `TsunagariCare_SmartHome_Bridge_Demo/config.example.h`
+- `PROJECT_HISTORY.md`
+
+## Demo Mode And GPIO
+
+- Added `SMART_HOME_DEMO_MODE` with default fallback `0`.
+- Added optional demo LED pin macros with default fallback `-1`:
+  - `DEMO_LIVING_LED_PIN`
+  - `DEMO_BEDROOM_LED_PIN`
+  - `DEMO_AC_LED_PIN`
+- Updated `config.example.h` only. The real `config.h` remains untouched.
+- Demo pins are configured only when demo mode is enabled and the pin value is
+  non-negative.
+- Boot state remains all devices off with AC set temperature 26 C, and all
+  configured demo outputs are driven off on startup.
+
+## V2 Devices And Actions
+
+- Added semantic device IDs:
+  - `living_light`
+  - `bedroom_light`
+  - `air_conditioner`
+- V2 light devices support `on`, `off`, and `toggle`.
+- V2 air conditioner supports `on`, `off`, `toggle`, `set_temperature`,
+  `temperature_up`, and `temperature_down`.
+- AC set temperature is constrained to 16-30 C.
+- Temperature changes do not automatically power on the AC.
+- Added numeric command value parsing through `SmartHomeCommand::hasValue` and
+  `SmartHomeCommand::value`.
+
+## Output Architecture
+
+- Added output helpers so `SmartHomeState` is the source of truth:
+  - `applyLivingLightOutput()`
+  - `applyBedroomLightOutput()`
+  - `applyAirConditionerOutput()`
+  - `applyDeviceOutputs()`
+- Living light continues to drive the existing legacy `LED_PIN`; when demo mode
+  is enabled it can also drive `DEMO_LIVING_LED_PIN`.
+- Bedroom light and AC demo LEDs are optional and only active in demo mode.
+- LED outputs remain simulation outputs for demo mode. Real AC/light IR support
+  is preserved through existing `ir_send` commands.
+
+## Legacy Compatibility
+
+- Existing `device_control` + `light_001` still works and controls the living
+  light state/output.
+- Existing `ir_hub_001`, `ir_send`, and `ir_learn` behavior remains unchanged.
+- Existing IR keys are preserved:
+  - `room_light_power`
+  - `ac_cool_26`
+  - `ac_off`
+- `room_light_power` does not infer living light state.
+- Successful `ac_cool_26` IR send updates local AC state to power on and 26 C.
+- Successful `ac_off` IR send updates local AC power off.
+- No server, Dashboard, Chami/Xiaozhi, Firebase path, or API changes were made.
+
+## Command Results
+
+- `living_light` on/off/toggle reports `living_light_on` or `living_light_off`.
+- `bedroom_light` on/off/toggle reports `bedroom_light_on` or
+  `bedroom_light_off`.
+- `air_conditioner` on/off/toggle reports `ac_on` or `ac_off`.
+- `air_conditioner` set/step temperature reports `ac_temperature_<value>`.
+- Out-of-range AC set temperature reports `invalid_temperature`.
+
+## Notes
+
+- Phase 2 duplicate-command and pending `/done` retry behavior is reused for V2
+  commands; no second dedupe path was added.
+- Exact GPIO mapping for the three demo LEDs is still required before hardware
+  testing.
+
+# 2026-08-08 21:15:16 +09:00 - Smart Home V2 Phase 2 Network Resilience
+
+## Goal
+
+Implemented Smart Home V2 Phase 2 for the ESP32 Smart Home Bridge firmware:
+non-blocking Wi-Fi connectivity, finite HTTP timeout, clearer server
+reachability state, and safer command done retry behavior.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/TsunagariCare_SmartHome_Bridge_Demo.ino`
+- `PROJECT_HISTORY.md`
+
+## Network State Changes
+
+- Replaced the blocking Wi-Fi reconnect loop in `connectWiFi()` with a
+  non-blocking connection start.
+- Added `WifiConnectionState` with disconnected, connecting, and connected
+  runtime states.
+- Added `updateNetworkState()` and call it from `loop()`.
+- Wi-Fi retry interval: 5000 ms.
+- Wi-Fi connection timeout: 15000 ms.
+- Offline command polling now skips quickly instead of trying to reconnect from
+  inside GET/POST helpers.
+- `handleIRLearnMode()` still runs every loop and no longer depends on Internet
+  connectivity.
+
+## HTTP Timeout And Server State
+
+- Added `HTTP_TIMEOUT_MS = 4000` via `HTTPClient::setTimeout(...)`.
+- Wi-Fi offline sets `smartHomeState.wifiConnected = false` and
+  `smartHomeState.serverConnected = false`.
+- HTTP transport failure sets `serverConnected = false`.
+- Any positive HTTP response code marks the Bridge as reachable, so application
+  errors such as 400/404 are not treated as server connectivity loss.
+- HTTPS behavior and insecure client strategy remain unchanged for this phase.
+
+## Command Polling
+
+- Kept `CHECK_INTERVAL_MS = 3000`.
+- Polling still uses the existing endpoint:
+  `/api/smart-home/commands/next?deviceId=smart_home_001`.
+- Polling skips while Wi-Fi is offline and resumes automatically after Wi-Fi
+  reconnects.
+
+## Dedupe And Done Retry
+
+- Replaced the early Phase 1 command-id remember behavior with
+  `lastExecutedCommandId`.
+- Commands are marked executed only after the physical/local action is accepted
+  or completed:
+  - light LED command after GPIO state is updated
+  - IR send command after raw IR send succeeds
+  - IR learn command after learn mode starts
+- Added a single in-memory pending done retry slot:
+  `pendingDoneCommandId`, `pendingDoneResult`, and `pendingDoneMessage`.
+- If `/commands/{id}/done` fails due transport/server retryable failure, the
+  firmware retries the done call every 5000 ms when Wi-Fi is back.
+- If the same command appears again while done is pending, the firmware does not
+  execute it again; it retries the done call instead. This avoids repeating IR
+  toggles or AC IR commands after a done failure.
+- No NVS/persistent dedupe was added.
+
+## Preserved Compatibility
+
+No API, Firebase schema, dashboard, Chami/Xiaozhi, GPIO, TFT, touch, BME280,
+new LEDs, or `config.h` changes were made.
+
+Existing behavior remains for:
+
+- `device_control`
+- `light_001`
+- `ir_hub_001`
+- `ir_send`
+- `ir_learn`
+- `room_light_power`
+- `ac_cool_26`
+- `ac_off`
+- raw IR send
+- AC repeat behavior
+- device-status POST
+- command done API
+- SmartHomeState and SmartHomeCommand from Phase 1
+
+## Checks
+
+- `rg` confirmed there is no remaining `while (WiFi.status...)` blocking loop.
+- `rg` confirmed `connectWiFi()` is no longer called from GET/POST helpers.
+- `git diff --check` passed for firmware files with only Windows line-ending
+  warnings.
+- Simple brace-count check passed for the firmware file:
+  `braces open=131 close=131`.
+
+## Tests Not Run
+
+- Arduino compile was not run because `arduino-cli` was not available in PATH.
+- PlatformIO compile was not run because `pio` was not available in PATH.
+- No real ESP32 hardware test was run in this environment.
+- Wi-Fi loss/reconnect, server outage, IR learn, IR send, and done retry still
+  need validation on the actual board.
+
+## Known Limitations
+
+- HTTP calls remain synchronous but now have a 4000 ms timeout.
+- Done retry is RAM-only and resets on reboot.
+- Only one pending done retry is stored at a time.
+- Initial device status is retried after Wi-Fi connection, but it is still sent
+  through the existing Bridge API and depends on server availability.
+
+## Next Step
+
+Recommended Phase 3: add Demo Mode device output mapping for V2 device ids while
+keeping legacy `light_001`, `ir_hub_001`, and IR paths intact.
+
+# 2026-08-08 21:00:01 +09:00 - Smart Home V2 Phase 1 Internal State And Command Dispatch
+
+## Goal
+
+Implemented Smart Home V2 Phase 1 for the ESP32 Smart Home Bridge firmware only.
+This phase normalizes internal state and command handling while keeping the
+existing external behavior and compatibility intact.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/TsunagariCare_SmartHome_Bridge_Demo.ino`
+
+## Files Added
+
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeState.h`
+- `TsunagariCare_SmartHome_Bridge_Demo/SmartHomeCommand.h`
+
+## Internal State
+
+Added `SmartHomeState` with:
+
+- `livingLight`
+- `bedroomLight`
+- `acPower`
+- `acSetTemperature`
+- `roomTemperature`
+- `humidity`
+- `pressure`
+- `wifiConnected`
+- `serverConnected`
+- `lastCommandAt`
+
+Phase 1 keeps sensor values as default `NAN`, defaults AC set temperature to
+26, and does not add new GPIO, LED, TFT, touch, BME280, button, buzzer, or
+hardware behavior.
+
+## Internal Command Flow
+
+Added `SmartHomeCommand` and routed server command handling through:
+
+```text
+parse server command
+-> normalize to SmartHomeCommand
+-> dispatchCommand()
+-> execute existing device_control / ir_learn / ir_send behavior
+-> update SmartHomeState where safe
+-> keep existing device-status POST
+-> keep existing /commands/{id}/done flow
+```
+
+The old `processCommand(...)` path was replaced by the shared dispatcher.
+
+## Backward Compatibility Kept
+
+The firmware still supports the existing command/device/API contract:
+
+- `light_001`
+- `ir_hub_001`
+- `device_control`
+- `ir_send`
+- `ir_learn`
+- `room_light_power`
+- `ac_cool_26`
+- `ac_off`
+- existing command polling endpoint
+- existing `device-status` endpoint
+- existing `/commands/{commandId}/done` endpoint
+- existing IR receiver/transmitter behavior
+
+No dashboard, Chami/Xiaozhi, server API, Firebase schema, GPIO, `config.h`, or
+secret file was changed.
+
+## State Mapping
+
+- `device_control + light_001 + on` sets the legacy LED on and
+  `smartHomeState.livingLight = true`.
+- `device_control + light_001 + off` sets the legacy LED off and
+  `smartHomeState.livingLight = false`.
+- `device_control + light_001 + toggle` keeps the old LED toggle behavior and
+  mirrors the result into `smartHomeState.livingLight`.
+- `ir_send + ac_cool_26` keeps raw IR send/repeat behavior; after successful IR
+  send, it sets `acPower = true` and `acSetTemperature = 26`.
+- `ir_send + ac_off` keeps raw IR send/repeat behavior; after successful IR
+  send, it sets `acPower = false`.
+- `ir_send + room_light_power` keeps raw IR send behavior and intentionally does
+  not infer ON/OFF state because the learned IR key is a toggle.
+
+## Command Id Safety
+
+Added an in-memory `lastProcessedCommandId` guard. If the same command id is
+seen again in the same runtime, execution is skipped and the existing done API
+is called with a duplicate result. No NVS/persistent dedupe was added.
+
+## Connection State
+
+Phase 1 did not refactor blocking Wi-Fi behavior. The existing blocking
+`connectWiFi()` flow remains. The firmware now mirrors connection observations
+into `smartHomeState.wifiConnected` and `smartHomeState.serverConnected`.
+
+## Checks
+
+- `rg` confirmed the old `processCommand(` path is gone and the new
+  `dispatchCommand(` path is present.
+- `git diff --check` passed for firmware Phase 1 files with only the existing
+  Windows line-ending warning.
+- Simple brace-count check passed for the firmware file:
+  `braces open=102 close=102`.
+
+## Tests Not Run
+
+- Arduino compile was not run because `arduino-cli` was not available in PATH.
+- PlatformIO compile was not run because `pio` was not available in PATH.
+- No hardware test was run in this environment.
+- IR receiver/transmitter, onboard LED, real Bridge API polling, and command
+  done flow still need real ESP32 validation.
+
+## Known Limitations
+
+- Wi-Fi reconnect remains blocking and should be handled in a later phase.
+- Dedupe is in-memory only and resets on reboot.
+- No TFT, touch, BME280, new demo LEDs, physical buttons, buzzer, Dashboard V2,
+  or Chami/Xiaozhi V2 changes are included.
+- Smart Home command completion still follows the existing backend behavior
+  where `/done` removes the command instead of preserving completed/failed
+  command records.
+
+## Next Step
+
+Recommended next phase: add Demo Mode LED device mapping for V2 devices while
+keeping the existing IR and `light_001` compatibility paths.
+
 # 2026-08-05 01:30:19 +09:00 - Correction: Fall Detection Camera Is WebRTC Host
 
 ## Reason
@@ -2773,3 +4246,368 @@ bang Admin SDK, nen rules co the khoa write tu client.
   `webrtc-signaling.js` la thay doi tu phase WebRTC truoc; UI phase nay khong
   sua cac file do.
 - Khong commit, khong push, khong ghi secret.
+
+# 2026-08-07 00:00 +09:00 - Improve Fall Detection accuracy state machine
+
+## Muc tieu
+
+- Giam false positive khi vua bat camera, landmark MediaPipe chua on dinh,
+  nguoi dung dung/ngoi/cui/nam ngu co chu y, nguoi ra khoi khung hinh, hoac chi
+  thay mot phan co the.
+- Khong con xac nhan nga chi vi co the nam ngang hoac lying duration du lau.
+- Giu nguyen webcam stream hien co cho MediaPipe, Fall Detection va WebRTC
+  publisher; khong goi `getUserMedia` lan hai.
+
+## Audit logic cu
+
+- Dieu kien cu: `calculatePosture()` lay bounding box landmark hop le, neu
+  `bodyWidth > bodyHeight * 1.3` thi posture = `Lying`.
+- `handleFallDetection()` bat dau `lyingStartAt` ngay khi posture = `Lying`.
+- Sau `SUSPECTED_FALL_MS = 1500` va confidence >= `MIN_FALL_CONFIDENCE = 0.7`,
+  code tao Firestore `fallAlerts` status `suspected`.
+- Sau `CONFIRMED_FALL_MS = 3000`, code goi `confirmFallFromCamera()` va
+  `handleFallConfirmed()`.
+- Cooldown cu: `FALL_ALERT_COOLDOWN_MS = 30000` va
+  `FALL_EMERGENCY_COOLDOWN_MS = 30000`.
+- Reset cu: `resetFallEvent()` clear `lyingStartAt`, alert id, pending flags,
+  confirmed flags, flow id va Chami state.
+- Mat pose hoac posture khac `Lying` co the reset sau grace, nhung khong co
+  quality gate/thoi gian warm-up rieng.
+- Nguyen nhan false alert chinh: logic dua nhieu vao frame/posture ngang va
+  timer ngan; khi camera vua start, initial landmark jump/stale transient state
+  co the tao lying candidate truoc khi pose on dinh.
+
+## Thay doi thuat toan
+
+- Them `tsunagari-care/src/js/fall-detection-engine.js`.
+- State machine moi co cac state:
+  `INITIALIZING`, `NO_PERSON`, `POSE_UNCERTAIN`, `NORMAL`, `SITTING`,
+  `CONTROLLED_DESCENT`, `CONTROLLED_LYING`, `SLEEPING`, `FALL_CANDIDATE`,
+  `VERIFYING`, `CONFIRMED_FALL`, `RECOVERING`, `RECOVERED`, `COOLDOWN`.
+- Warm-up 8000 ms sau Start Camera; trong warm-up khong tao candidate, khong
+  tao Firebase fall alert, khong gui robot command, khong confirmed fall.
+- Pose quality gating yeu cau vai, hong, it nhat mot diem lower body, landmark
+  visibility/presence >= 0.55, va 10 valid frames truoc khi scoring.
+- Temporal history giu trong 4000 ms gom timestamp, body center, hip center,
+  shoulder center, torso angle, bbox width/height, aspect ratio, pose
+  confidence, floor proximity, zone va movement speed.
+- Feature tinh moi: vertical displacement, descent speed, rotation delta/speed,
+  bbox height drop, aspect ratio, horizontal posture, floor proximity, active
+  zone, immobility va recovery posture.
+- Fall score gom rapid descent, slow collapse, torso rotation, height drop,
+  horizontal posture, near floor, post-fall immobility, outside-safe-zone bonus,
+  controlled-descent penalty, bed penalty va sofa penalty.
+- Candidate chi duoc tao khi co prior upright/sitting gan day, near floor,
+  score >= 6, ngoai bed/sofa safe zone, va khong phai controlled descent.
+- Confirmed danger alert chi ghi sau verifying window, score >= 8, near floor,
+  horizontal posture, khong recovery, khong trong safe sleeping zone, va robot
+  timeout/fallback policy cho phep.
+
+## Fast fall / slow collapse / controlled lying
+
+- Fast fall: rapid descent speed cao, torso rotation nhanh, height drop, near
+  floor va ket thuc ngoai safe zone.
+- Slow collapse: body center ha dan trong temporal window, ket thuc near floor,
+  score du nguong, khong recovery.
+- Controlled lying: descent cham, rotation cham, khong impact-like score, hoac
+  nam trong bed/sofa zone; state thanh `CONTROLLED_LYING` hoac `SLEEPING`.
+- Sleeping tren giuong/sofa: neu body/hip center trong bed/sofa, nam ngang,
+  motion thap va khong co rapid descent thi khong tao danger alert.
+
+## Zones
+
+- Them `tsunagari-care/src/js/fall-zone-manager.js`.
+- Zone luu localStorage key `tsunagariCareFallZones`.
+- Ho tro rectangle normalized 0.0-1.0 cho `bed`, `sofa`, `floor`.
+- UI toi thieu: Configure Zones, chon type, drag rectangle tren preview, Save,
+  Cancel, Clear Zone Configuration.
+- Neu chua co floor zone, engine dung fallback floor normalized Y=0.72 va UI/log
+  hien `fallback_floor` khi active.
+- Khong upload anh/video/frame; khong ghi Firebase zone config.
+
+## Robot, alert policy, cooldown
+
+- `FALL_CANDIDATE` va `VERIFYING` chi local/debug va care event warning
+  `fall_verification_requested`; khong tao Firestore danger fall alert.
+- Robot Chami duoc yeu cau bang flow command hien co `emergency_check` trong
+  verification. Neu command path loi, log `robot verification unavailable` va
+  dung visual fallback.
+- Chua co parser robot response trong frontend phase nay; khong fake user
+  response, khong fake robot da xac nhan safe.
+- Confirmed alert payload giu backward-compatible fields va them optional:
+  `severity`, `score`, `reasons`, `zone`, `eventId`, `verification`,
+  `alertSent`, `isTest`, `sourceDetail`.
+- Cooldown/dedup ban dau: 90000 ms cho alert va robot command.
+- Start Camera reset pose history, score, candidate timestamps, verification
+  timer, lying timer, previous motion state, pending robot verification, local
+  transient flags va state machine; khong xoa Firebase alert cu.
+- Test Fall Alert giu nut cu, khong di qua pose algorithm, ghi
+  `sourceDetail: manual_test`, `isTest: true`, va reset state sau test.
+
+## Files sua / tao moi
+
+- Tao moi `tsunagari-care/src/js/fall-detection-engine.js`.
+- Tao moi `tsunagari-care/src/js/fall-zone-manager.js`.
+- Sua `tsunagari-care/fall-camera.js`.
+- Sua `tsunagari-care/fall-camera.html`.
+- Sua `tsunagari-care/fall-camera.css`.
+- Sua `PROJECT_HISTORY.md`.
+
+## Checks
+
+- `node --check tsunagari-care/fall-camera.js` passed.
+- `node --check tsunagari-care/src/js/fall-detection-engine.js` passed.
+- `node --check tsunagari-care/src/js/fall-zone-manager.js` passed.
+- `node --check tsunagari-care/src/js/webrtc-signaling.js` passed.
+- `node --check tsunagari-care/src/js/family-view.js` passed.
+- `git diff --check` passed; Git only warned LF will be replaced by CRLF.
+- `git grep -n "getUserMedia" -- tsunagari-care` shows only
+  `tsunagari-care/fall-camera.js`.
+- `git grep -n "CONFIRMED_FALL\|FALL_CANDIDATE\|CAMERA_WARMUP" --
+  tsunagari-care` checked state-machine usage.
+- Secret pattern grep found existing variable-name references only; no new
+  secret value was added.
+
+## Manual tests da chay
+
+- Static syntax checks and grep checks above.
+- No real camera/browser/WebRTC manual test was run in this session.
+- Attempted to start local server on `127.0.0.1:5500`; Python launcher was not
+  usable and the Node Start-Process helper did not stay running.
+
+## Test chua chay
+
+- 40 requested physical/browser scenarios need real camera, MediaPipe runtime,
+  configured zones, Firebase connectivity, WebRTC Family Viewer tabs, and robot
+  command path.
+- Chua test thuc te Tab 1 `fall-camera.html` va Tab 2 `family-view.html`.
+- Chua do precision/recall/F1/latency bang dataset; chi tao metadata-friendly
+  alert/candidate fields de tuning sau.
+
+## Threshold initial values va limitations
+
+- Initial values: warm-up 8000 ms, min visibility 0.55, min valid pose frames
+  10, invalid pose gap 800 ms, history 4000 ms, post-fall verify 5000 ms, robot
+  timeout 12000 ms, recovery grace 8000 ms, cooldown 90000 ms, candidate score
+  6, confirmed score 8.
+- Cac nguong chua duoc toi uu; can tune theo goc camera, do cao camera, kich
+  thuoc phong, vi tri giuong/sofa, khoang cach nguoi-camera, anh sang va frame
+  rate.
+- Robot response parsing chua duoc tich hop; frontend chi tao pending
+  verification command va dung no-response/visual fallback.
+- Khong commit, khong push, khong deploy Firebase Rules, khong sua backend.
+
+# 2026-08-07 02:30 +09:00 - Fall temporal confirmation peak evidence fix
+
+## Scope
+
+- Modified only temporal confirmation logic in:
+  - `tsunagari-care/src/js/fall-detection-engine.js`
+  - `tsunagari-care/fall-camera.html`
+  - `PROJECT_HISTORY.md`
+- Audited `tsunagari-care/fall-camera.js`; no UI design, WebRTC, Firebase
+  paths, zone editor, MediaPipe setup, robot command flow, or backend changes.
+
+## Temporal confirmation fixes
+
+- Candidate events now preserve their own peak evidence independently from the
+  rolling pose history.
+- Chosen approach: keep `poseHistoryWindowMs` at 4000 ms and store candidate
+  peak evidence on the candidate itself. This keeps motion scoring bounded to
+  recent pose history while preventing the movement frame that created a strong
+  candidate from being lost before the 5000 ms visual verification window ends.
+- Added candidate fields:
+  - `peakScore`
+  - `peakReasons`
+  - `lastStrongEvidenceAt`
+  - `initialSample`
+  - `lastSample`
+- Candidate update now applies
+  `candidate.peakScore = Math.max(candidate.peakScore, scoring.score)`.
+- Strong reason codes are merged into `peakReasons` without duplicates.
+- Visual confirmation now uses
+  `effectiveScore = Math.max(candidate.peakScore, scoring.score)`, so a
+  candidate that reached the confirmed threshold can still confirm after the
+  original movement frames leave rolling history, as long as the current pose is
+  still horizontal, near floor, outside safe zones, and unrecovered.
+- Added `candidateUncertaintyGraceMs: 2500`.
+- Invalid pose handling no longer deletes a high-confidence candidate as soon as
+  `maxInvalidPoseGapMs` passes. Strong candidates stay in `VERIFYING` during the
+  uncertainty grace period, weak candidates cancel after the 800 ms invalid-pose
+  gap, and missing pose never confirms a fall by itself.
+- Recovery to standing/sitting still cancels an active candidate as recovered.
+- `fall-camera.html` initial verification label now says `0.0s / 5.0s` to
+  match `postFallVerifyMs: 5000`.
+
+## Deterministic engine harness
+
+- Added `runDeterministicTests()` to
+  `tsunagari-care/src/js/fall-detection-engine.js` for Node/browser-independent
+  state-machine checks.
+- Covered scenarios:
+  - standing at startup
+  - horizontal pose during warm-up
+  - fast fall reaching peak score 9, then lying still for 5 seconds
+  - candidate score dropping after initial fall
+  - pose disappearing briefly after a strong candidate
+  - recovery to standing
+  - controlled lying in bed zone
+- Critical assertion covered: a candidate whose peak score reached the
+  confirmed threshold remains confirmable after the movement frames leave the
+  rolling history, provided current visual evidence remains horizontal, near
+  floor, outside safe zones, and unrecovered.
+
+## fall-camera.js legacy audit
+
+- Active:
+  - `lyingStartAt`, `fallEventActive`, `currentFallAlertId`,
+    `fallAlertCreatePending`, `nextFallEventAllowedAt`,
+    `lastFallEmergencyCommandAt`, `fallEmergencyCommandPending`,
+    `currentFallEventConfirmed`, `chamiCheckSentForCurrentEvent`,
+    `lastPersonDetected`, `currentFallStage`, `currentChamiCommandId`,
+    `currentFallFlowId`, `fallConfirmedCareEventWritten`,
+    `robotVerificationStartedAt`, `robotVerificationUnavailable`,
+    `latestFallDetectionResult`, `currentFallScore`
+  - `getCurrentLyingDuration()`, `getVerificationDurationMs()`,
+    `resetFallEvent()`, `resetTransientFallDetection()`,
+    `handleFallDetection()`, `requestRobotFallVerification()`,
+    `canDispatchConfirmedFall()`, `handleFallConfirmed()`,
+    `confirmFallFromCamera()`
+- Legacy but still referenced:
+  - `confirmedUpdateSent`, `confirmedUpdatePending`: still referenced by
+    `markCurrentFallAlertConfirmedIfNeeded()` and reset logic, but the current
+    confirmed-alert path creates the confirmed alert directly.
+  - `fallEventGeneration`: still incremented by reset logic, but the old async
+    suspected-alert generation guard is gone.
+  - `fallExitStartedAt`, `lastLyingDurationLoggedAt`, `suspectedFallLogged`:
+    still assigned/reset, but no longer drive the current engine-based temporal
+    confirmation flow.
+- Unused and safe to remove later:
+  - `handleFallConfirmedLegacy()`
+  - `markCurrentFallAlertConfirmedIfNeeded()`
+
+## Checks
+
+- `node --check tsunagari-care/src/js/fall-detection-engine.js`: passed.
+- `node --check tsunagari-care/fall-camera.js`: passed.
+- `node -e "const engine = require('./tsunagari-care/src/js/fall-detection-engine.js'); const result = engine.runDeterministicTests({ throwOnFailure: true }); console.log(JSON.stringify(result, null, 2));"`:
+  passed all 7 deterministic tests.
+- No commit, no push.
+
+# 2026-08-07 03:15 +09:00 - Suppress bending false-positive fall candidates
+
+## Scope
+
+- Modified only:
+  - `tsunagari-care/src/js/fall-detection-engine.js`
+  - `tsunagari-care/fall-camera.js`
+  - `PROJECT_HISTORY.md`
+- `fall-camera.js` change is label-only for the new `BENDING` engine state.
+- Did not change WebRTC, Firebase paths, robot flow, zone editor, backend, or
+  Family Viewer.
+
+## Fix
+
+- Removed `maxY >= 0.9` from fallback floor proximity.
+- Fallback floor is now true only when both center thresholds are met:
+  - `fallbackFloorHipY: 0.68`
+  - `fallbackFloorBodyY: 0.66`
+- Added lower-body sample fields:
+  - `kneeCenterY`
+  - `ankleCenterY`
+  - `legSpan`
+  - `uprightLegSupport`
+- Added `minStandingLegSpan: 0.22`.
+- Added `BENDING` state and `BENDING_WITH_LEG_SUPPORT` reason.
+- Added `bendingWithLegSupportPenalty: -6`.
+- Added hip evidence:
+  - `hipCenterDeltaY`
+  - `hipDescentSpeed`
+  - `minHipDropForFall: 0.14`
+  - `rapidHipDescentSpeed: 0.28`
+  - reason codes `HIP_DROP` and `RAPID_HIP_DESCENT`
+- Candidate creation now requires:
+  - score threshold
+  - floor proximity
+  - at least one movement evidence reason
+  - at least one end-state evidence reason
+  - meaningful hip descent or very strong whole-body descent without upright leg
+    support
+  - not `BENDING`
+  - not bed/sofa safe zone
+  - not controlled descent
+- Explicit bending suppression blocks candidates when upright leg support is
+  present, posture is bending, hip drop is below threshold, fallback floor is
+  the floor source, and rapid hip descent is absent.
+- Preserved peak-score confirmation, uncertainty grace, recovery, bed/sofa safe
+  zones, robot verification, and cooldown behavior.
+
+## Deterministic tests
+
+- Expanded `runDeterministicTests()` output so every scenario reports:
+  `uprightLegSupport`, `hipCenterDeltaY`, `hipDescentSpeed`,
+  `floorProximity`, `movementEvidenceCount`, `endStateEvidenceCount`, and
+  final `candidateReady`.
+- Covered:
+  - standing at startup
+  - horizontal pose during warm-up
+  - standing upright
+  - bending 30 degrees
+  - deep bending to pick up an object
+  - squatting
+  - kneeling
+  - fast fall reaching peak score 9 and confirming after 5 seconds
+  - candidate score dropping after initial fall
+  - pose disappearing briefly after a strong candidate
+  - recovery to standing
+  - controlled lying in bed zone
+  - bending where ankle landmarks remain near image bottom
+  - bending must never produce `FALL_CANDIDATE`
+  - fast fall must still produce `FALL_CANDIDATE`
+  - slow collapse must still be detectable
+  - `maxY >= 0.9` alone is not near floor
+
+## Checks
+
+- `node --check tsunagari-care/src/js/fall-detection-engine.js`: passed.
+- `node --check tsunagari-care/fall-camera.js`: passed.
+- Deterministic tests: passed all scenarios listed above.
+- `git diff --check`: passed with existing CRLF warnings only.
+- No commit, no push.
+
+# 2026-08-07 03:35 +09:00 - Bending diagnostics and posture UI consistency
+
+## Scope
+
+- Modified only:
+  - `tsunagari-care/src/js/fall-detection-engine.js`
+  - `tsunagari-care/fall-camera.js`
+  - `PROJECT_HISTORY.md`
+- Did not change thresholds, Firebase, WebRTC, robot flow, zones, backend, or
+  Family Viewer.
+
+## Fix
+
+- Removed unreachable `sample.fallbackFloorProximity` requirement from
+  `bendingSuppressed`.
+- `bendingSuppressed` now requires upright leg support, engine posture
+  `bending`, hip drop below `minHipDropForFall`, and no `RAPID_HIP_DESCENT`.
+- Kept candidate gate `posture !== "bending"`.
+- Exposed `bendingSuppressed` in deterministic diagnostics.
+- Added deterministic assertions that deep supported bending has engine posture
+  `bending`, `candidateReady: false`, and `bendingSuppressed: true`.
+- Added deterministic assertions that fast fall still has
+  `candidateReady: true` and alert thresholds remain candidate `6` and
+  confirmed `8`.
+- Updated Fall Camera posture status display to prefer engine posture labels
+  (`Standing`, `Sitting`, `Bending`, `Lying`, `Unknown`) while preserving
+  `calculatePosture()` for person detection, render confidence, and bounding
+  box data.
+
+## Checks
+
+- `node --check tsunagari-care/src/js/fall-detection-engine.js`: passed.
+- `node --check tsunagari-care/fall-camera.js`: passed.
+- Deterministic tests: passed.
+- `git diff --check`: passed with existing CRLF warnings only.
+- No commit, no push.
