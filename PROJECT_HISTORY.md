@@ -1,3 +1,221 @@
+# 2026-08-12 02:28:33 +09:00 - Smart Home V2 Dashboard Device State Sync
+
+## Goal
+
+Updated the main Dashboard Smart Home device section to use the Smart Home V2
+semantic device model while preserving legacy IR/device-status compatibility.
+
+## Previous Flow
+
+- Dashboard rendered device records directly from `devices`, so legacy records
+  such as `light_001`, `light01`, `ac01`, and `ir_hub_001` could appear in the
+  Smart Home section.
+- The main light row used `room_light_power` IR and a local fake toggle helper.
+- AC controls used legacy IR keys `ac_cool_26` and `ac_off`.
+
+## New Semantic Flow
+
+- Dashboard renders exactly three logical Smart Home devices:
+  `living_light`, `bedroom_light`, and `air_conditioner`.
+- Main Dashboard clicks now send `POST /api/smart-home/commands` through the
+  existing `createBackendSmartHomeCommand()` path with:
+  `targetDeviceId=smart_home_001`, `type=device_control`, semantic `device`,
+  and `action=on/off`.
+- The ESP32 continues polling the existing command queue and dispatches
+  semantic V2 device commands to the shared Smart Home state/outputs.
+
+## Bridge State Schema
+
+The existing bridge `POST /api/smart-home/device-status` payload now preserves
+environment and also includes optional Smart Home V2 state:
+
+```json
+{
+  "deviceId": "smart_home_001",
+  "status": "online",
+  "environment": {
+    "sensorAvailable": true,
+    "temperature": 26.3,
+    "humidity": 46,
+    "pressure": 1000
+  },
+  "smartHome": {
+    "livingLight": true,
+    "bedroomLight": false,
+    "acPower": true,
+    "acSetTemperature": 27
+  }
+}
+```
+
+Old `/device-status` payloads without `smartHome` remain valid.
+
+## Fallback Behavior
+
+- Dashboard state priority is:
+  1. `devices/smart_home_001/smartHome`
+  2. legacy `light_001`/`light01` for Living and `ac01` for AC
+  3. `unknown`
+- `smart_home_001`, `ir_hub_001`, `light_001`, `light01`, and `ac01` are not
+  shown as duplicate main Smart Home controls.
+- Device count for the Smart Home section is now the three logical devices.
+
+## Files Changed
+
+- `tsunagari-care/src/js/dashboard.js`
+- `server/routes/smartHome.js`
+- `server/lib/smartHomeCommands.js`
+- `TsunagariCare_SmartHome_Bridge_Demo/TsunagariCare_SmartHome_Bridge_Demo.ino`
+- `PROJECT_HISTORY.md`
+
+## Compatibility
+
+- Legacy IR helpers and keys remain: `room_light_power`, `ac_cool_26`,
+  `ac_off`, `ir_send`, and `ir_hub_001`.
+- Legacy demo toggle path remains available outside the main V2 device rows.
+- BME280 environment sync remains in the same 10 second bridge status payload.
+- Command `value` is now preserved optionally for future/current
+  `set_temperature` commands without adding a required field.
+
+## Checks
+
+- `node --check tsunagari-care/src/js/dashboard.js` passed.
+- `node --check server/routes/smartHome.js` passed.
+- `node --check server/lib/smartHomeCommands.js` passed.
+
+## Next Step
+
+- Deploy the Dashboard/server changes.
+- Re-upload ESP32 firmware so `devices/smart_home_001/smartHome` syncs real
+  V2 device state with the cloud.
+- Hardware retest Dashboard click and TFT touch round-trip for Living, Bedroom,
+  AC, and BME280.
+
+# 2026-08-12 02:11:42 +09:00 - Smart Home V2 BME280 Cloud Sync
+
+## Goal
+
+Added the minimal firmware-side BME280 cloud sync path for the Smart Home V2
+ESP32. This pass only changes Smart Home firmware sensor sync and does not
+modify Dashboard, server API contract, Firebase schema, Chami, Fall Detection,
+TFT, touch, WS2812, buzzer, IR behavior, GPIO map, command polling, or command
+dedupe.
+
+## File Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/TsunagariCare_SmartHome_Bridge_Demo.ino`
+- `PROJECT_HISTORY.md`
+
+## Endpoint
+
+Reuses the existing endpoint:
+
+- `POST /api/smart-home/device-status`
+
+No new endpoint was added.
+
+## Interval
+
+- Added `SMART_HOME_ENV_SYNC_INTERVAL_MS = 10000`.
+- Sync uses `millis()` and does not send every loop.
+- Sync is skipped while Wi-Fi/bridge connectivity is not ready.
+- Failed server requests retry on a later interval and keep local TFT/sensor
+  operation running.
+
+## Payload
+
+Available BME280 sample:
+
+```json
+{
+  "deviceId": "smart_home_001",
+  "name": "Smart Home Bridge",
+  "type": "smart_home",
+  "status": "online",
+  "source": "smart_home_001",
+  "environment": {
+    "sensorAvailable": true,
+    "temperature": 26.3,
+    "humidity": 46,
+    "pressure": 1000
+  }
+}
+```
+
+Unavailable or invalid BME280 sample:
+
+```json
+{
+  "deviceId": "smart_home_001",
+  "name": "Smart Home Bridge",
+  "type": "smart_home",
+  "status": "online",
+  "source": "smart_home_001",
+  "environment": {
+    "sensorAvailable": false
+  }
+}
+```
+
+The firmware only includes numeric temperature, humidity, and pressure when
+`SmartHomeState` has a valid BME280 sample. It does not send NaN or fake values.
+
+## Functions
+
+- Added `hasValidSmartHomeEnvironmentSample()`.
+- Updated `updateSmartHomeEnvironmentStatus()` to build the exact environment
+  payload and emit readable test logs.
+- Updated `syncSmartHomeEnvironmentStatus(now)` to:
+  - enforce the 10 second interval
+  - allow an early first sync once a valid sample appears
+  - avoid retry spam if the first valid sync attempt fails
+
+## Serial Logs
+
+Expected available-sensor logs:
+
+```text
+Smart Home environment sync:
+temp=26.3
+humidity=46
+pressure=1000
+POST .../api/smart-home/device-status
+Environment sync status: 200
+```
+
+Expected unavailable-sensor log:
+
+```text
+BME280 unavailable, syncing sensorAvailable=false
+POST .../api/smart-home/device-status
+Environment sync status: 200
+```
+
+## Compatibility
+
+- Existing legacy `device-status` sync for `light_001` and `ir_hub_001` was
+  preserved.
+- Existing command polling, command done retry, dedupe, IR send/learn, TFT,
+  touch, WS2812, buzzer, and GPIO assignments were preserved.
+
+## Checks
+
+- Firmware brace count matched.
+- `git diff --check` passed for the firmware file with normal Windows CRLF
+  warning.
+- Real firmware compile was not completed because neither `pio` nor
+  `arduino-cli` is available in PATH.
+
+## Hardware Test Steps
+
+1. Upload the updated firmware to ESP32.
+2. Open Serial Monitor at 115200 baud.
+3. Confirm BME280 local TFT reading is valid.
+4. Confirm Serial shows `POST .../api/smart-home/device-status`.
+5. Confirm `Environment sync status: 200`.
+6. Confirm Firebase RTDB contains `devices/smart_home_001/environment`.
+7. Confirm Dashboard indoor card changes from demo values to BME280 values.
+
 # 2026-08-12 01:53:35 +09:00 - Smart Home V2 Dashboard Sensor Sync Display Guard
 
 ## Goal
