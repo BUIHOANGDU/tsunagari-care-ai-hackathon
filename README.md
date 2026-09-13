@@ -59,6 +59,33 @@ keys, or `.env` values in frontend files.
 Backend secrets belong in Render environment variables and local `.env` files.
 Never commit them.
 
+## Environment Setup
+
+For local backend development, copy `.env.example` to `.env` and fill only your
+local values. Keep `.env`, Firebase Admin service account JSON, LINE tokens,
+device tokens, family access codes, and private keys out of Git.
+
+Required backend values depend on the feature you run:
+
+- `FIREBASE_DATABASE_URL`
+- `FIREBASE_SERVICE_ACCOUNT_JSON`
+- `TSUNAGARI_DEVICE_TOKEN`
+- `LINE_MESSAGING_ENABLED`
+- `LINE_CHANNEL_ACCESS_TOKEN`
+- `LINE_CAREGIVER_USER_IDS`
+- `FAMILY_ACCESS_CODE_HASH` or local-only `FAMILY_ACCESS_CODE`
+
+For ESP32 Smart Home firmware, copy:
+
+```text
+TsunagariCare_SmartHome_Bridge_Demo/config.example.h
+-> TsunagariCare_SmartHome_Bridge_Demo/config.h
+```
+
+Then fill local Wi-Fi, bridge URL, and device token values in `config.h`.
+`config.h` is ignored and must not be committed. The example file only contains
+placeholders and safe demo IDs.
+
 ## Deployment Notes
 
 - Render backend production runs from root `server/`.

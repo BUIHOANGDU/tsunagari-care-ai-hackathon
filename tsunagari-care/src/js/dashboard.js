@@ -16,7 +16,6 @@ const SMART_HOME_V2_DEVICE_IDS = new Set([
 ]);
 const DEFAULT_TSUNAGARI_BRIDGE_API_URL =
   "https://pt-tsunagari-care.onrender.com";
-const DEFAULT_TSUNAGARI_DEVICE_TOKEN = "DEV_TOKEN";
 const TOKYO_TIMEZONE = "Asia/Tokyo";
 const WEATHER_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 const ROOM_ENVIRONMENT_STALE_MS = 2 * 60 * 1000;
@@ -565,6 +564,8 @@ let fallResponseCareEventsLoaded = false;
 let fallTimelineLoadedLogged = false;
 let lastFallTimelineSignature = "";
 let lastMissingSafeFlowKey = "";
+let lastSmartHomeStateLogSignature = "";
+const loggedMissingSmartHomeStateFields = new Set();
 
 function isBridgeChamiDevice(device) {
   return device?.id === "chami_001" || device?.type === "ai_robot";
@@ -615,23 +616,109 @@ function readDevicePowerState(device) {
   );
 }
 
+function readLogicalDevicePowerState(container, fieldKeys, logicalDeviceId) {
+  if (!container || typeof container !== "object") return null;
+
+  for (const key of fieldKeys) {
+    const value = asBooleanOrNull(container[key]);
+    if (value !== null) return value;
+  }
+
+  const deviceState = container[logicalDeviceId];
+  if (deviceState && typeof deviceState === "object") {
+    return readDevicePowerState(deviceState);
+  }
+
+  return asBooleanOrNull(deviceState);
+}
+
+function readLogicalDeviceNumber(container, fieldKeys, logicalDeviceId) {
+  if (!container || typeof container !== "object") return null;
+
+  for (const key of fieldKeys) {
+    const value = asFiniteNumberOrNull(container[key]);
+    if (value !== null) return value;
+  }
+
+  const deviceState = container[logicalDeviceId];
+  if (deviceState && typeof deviceState === "object") {
+    for (const key of fieldKeys) {
+      const value = asFiniteNumberOrNull(deviceState[key]);
+      if (value !== null) return value;
+    }
+  }
+
+  return null;
+}
+
 function findDeviceById(devices, ids) {
   const wanted = new Set(ids);
   return (devices || []).find((device) => wanted.has(getDeviceId(device))) || null;
 }
 
 function normalizeSmartHomeControlState(bridgeDevice, devices) {
-  const smartHome = bridgeDevice?.smartHome || {};
+  const stateSources = [
+    bridgeDevice?.smartHome,
+    bridgeDevice?.devices,
+    bridgeDevice,
+  ];
   const legacyLight = findDeviceById(devices, [LIGHT_DEVICE_ID, LEGACY_LIGHT_DEVICE_ID]);
   const legacyAircon = findDeviceById(devices, [AIRCON_DEVICE_ID]);
+  const readPower = (fieldKeys, logicalDeviceId) => {
+    for (const source of stateSources) {
+      const value = readLogicalDevicePowerState(source, fieldKeys, logicalDeviceId);
+      if (value !== null) return value;
+    }
+    return null;
+  };
+  const readNumber = (fieldKeys, logicalDeviceId) => {
+    for (const source of stateSources) {
+      const value = readLogicalDeviceNumber(source, fieldKeys, logicalDeviceId);
+      if (value !== null) return value;
+    }
+    return null;
+  };
 
   return {
-    livingLight:
-      asBooleanOrNull(smartHome.livingLight) ?? readDevicePowerState(legacyLight),
-    bedroomLight: asBooleanOrNull(smartHome.bedroomLight),
-    acPower: asBooleanOrNull(smartHome.acPower) ?? readDevicePowerState(legacyAircon),
-    acSetTemperature: asFiniteNumberOrNull(smartHome.acSetTemperature),
+    livingLight: readPower(
+      ["livingLight", "living_light", "livingRoomLight", "living_room_light"],
+      V2_LIVING_LIGHT_DEVICE_ID,
+    ) ?? readDevicePowerState(legacyLight),
+    bedroomLight: readPower(
+      ["bedroomLight", "bedroom_light"],
+      V2_BEDROOM_LIGHT_DEVICE_ID,
+    ),
+    acPower: readPower(
+      ["acPower", "airConditioner", "air_conditioner", "aircon", "ac"],
+      V2_AIR_CONDITIONER_DEVICE_ID,
+    ) ?? readDevicePowerState(legacyAircon),
+    acSetTemperature: readNumber(
+      ["acSetTemperature", "setTemperature", "temperature", "targetTemperature"],
+      V2_AIR_CONDITIONER_DEVICE_ID,
+    ),
   };
+}
+
+function logDashboardSmartHomeState(bridgeDevice, controlState) {
+  if (!bridgeDevice) return;
+
+  const fields = ["livingLight", "bedroomLight", "acPower", "acSetTemperature"];
+  fields.forEach((field) => {
+    if (controlState[field] === null && !loggedMissingSmartHomeStateFields.has(field)) {
+      console.warn(`Smart Home V2: missing ${field} in bridge state`);
+      loggedMissingSmartHomeStateFields.add(field);
+    }
+  });
+
+  const signature = JSON.stringify(controlState);
+  if (signature === lastSmartHomeStateLogSignature) return;
+  lastSmartHomeStateLogSignature = signature;
+  console.log("Dashboard Smart Home state:", {
+    living: controlState.livingLight,
+    bedroom: controlState.bedroomLight,
+    ac: controlState.acPower,
+    temp: controlState.acSetTemperature,
+  });
 }
 
 function createSmartHomeV2DisplayDevice(id, type, state, extras = {}) {
@@ -693,14 +780,30 @@ function getAirconStatusText(device) {
 }
 
 function getSmartHomeV2ButtonLabel(device) {
-  const shouldTurnOn = device?.status !== "on";
-  return isAirconDevice(device)
-    ? shouldTurnOn
-      ? uiText("turnAirconOn")
-      : uiText("turnAirconOff")
-    : shouldTurnOn
-      ? uiText("turnLightOn")
-      : uiText("turnLightOff");
+  return getSmartHomeDevicePresentation(device).buttonText;
+}
+
+function getSmartHomeDevicePresentation(device) {
+  const status = String(device?.status || "").toLowerCase();
+  const isKnown = status === "on" || status === "off";
+  const isOn = status === "on";
+  const isAircon = isAirconDevice(device);
+
+  return {
+    isKnown,
+    isOn,
+    statusText: isAircon ? getAirconStatusText(device) : getLightStatusText(status),
+    buttonText: !isKnown
+      ? uiText("unknown")
+      : isAircon
+        ? isOn
+          ? uiText("turnAirconOff")
+          : uiText("turnAirconOn")
+        : isOn
+          ? uiText("turnLightOff")
+          : uiText("turnLightOn"),
+    nextAction: !isKnown ? "" : isOn ? "off" : "on",
+  };
 }
 
 function toggleLocalLightDisplayState() {
@@ -748,7 +851,7 @@ function getBridgeDeviceToken() {
   return (
     window.TSUNAGARI_DEVICE_TOKEN ||
     localStorage.getItem("tsunagari_device_token") ||
-    DEFAULT_TSUNAGARI_DEVICE_TOKEN
+    ""
   );
 }
 
@@ -792,7 +895,6 @@ async function createSmartHomeV2DeviceCommand(device, action, options = {}) {
     type: "device_control",
     device,
     action,
-    status: "pending",
   };
 
   if (options.value !== undefined && options.value !== null) {
@@ -807,7 +909,7 @@ async function createSmartHomeV2DeviceCommand(device, action, options = {}) {
     type: command.type,
     device: command.device,
     action: command.action,
-    status: command.status,
+    status: payload?.command?.status || "pending",
   });
 
   return {
@@ -961,9 +1063,11 @@ updateRobotSection = function (robot) {
 
 updateDevicesSection = function (devices) {
   const data = devices || [];
-  const smartHomeDevices = getSmartHomeDevicesForDisplay(data);
   const bridgeRobot = data.find((device) => device?.id === "chami_001");
   const smartHomeBridge = data.find(isSmartHomeBridgeDevice);
+  const controlState = normalizeSmartHomeControlState(smartHomeBridge, data);
+  logDashboardSmartHomeState(smartHomeBridge, controlState);
+  const smartHomeDevices = getSmartHomeDevicesForDisplay(data);
 
   latestSmartHomeDevices = smartHomeDevices.map((device) =>
     isLightDevice(device) && !isSmartHomeV2Device(device)
@@ -1092,11 +1196,14 @@ renderDevices = function (devices) {
     const isLight = isLightDevice(d);
     const isAircon = isAirconDevice(d);
     const deviceName = getDisplayDeviceName(d);
-    const deviceDetail = isAircon
-      ? getAirconStatusText(d)
-      : isLight
-        ? getLightStatusText(d.status)
-        : d.room || "";
+    const presentation = isV2Device ? getSmartHomeDevicePresentation(d) : null;
+    const deviceDetail = presentation
+      ? presentation.statusText
+      : isAircon
+        ? getAirconStatusText(d)
+        : isLight
+          ? getLightStatusText(d.status)
+          : d.room || "";
     const leftDiv = document.createElement("div");
     leftDiv.className = "left";
     leftDiv.innerHTML = `<strong>${deviceName}</strong><small>${deviceDetail}</small>`;
@@ -1115,13 +1222,20 @@ renderDevices = function (devices) {
         : d.status === "on"
           ? `${uiText("on")} · ${uiText("toggle")}`
           : uiText("toggle");
+    btn.disabled = Boolean(isV2Device && !presentation.isKnown);
     btn.onclick = async () => {
       const id = btn.dataset.id;
+      if (isV2Device && !presentation.isKnown) {
+        return;
+      }
       btn.disabled = true;
 
       try {
         if (isV2Device) {
-          const action = d.status === "on" ? "off" : "on";
+          const action = presentation.nextAction;
+          console.log(
+            `Dashboard semantic command:\ndevice=${id}\ncurrentState=${presentation.isOn}\nnextAction=${action}`,
+          );
           const payload = await createSmartHomeV2DeviceCommand(id, action);
           showCommandToast({
             ...payload,
@@ -1178,7 +1292,7 @@ renderDevices = function (devices) {
           {
             targetId: id,
             command: isV2Device
-              ? `${id}_${d.status === "on" ? "off" : "on"}`
+              ? `${id}_${presentation.nextAction || "unknown"}`
               : isLight
                 ? "living_room_light"
                 : isAircon

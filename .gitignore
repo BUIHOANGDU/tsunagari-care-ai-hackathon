@@ -1,12 +1,22 @@
-/.env
+.env
+.env.*
+!.env.example
+
 node_modules/
 dist/
+build/
 *.log
+.DS_Store
+
+# Firmware/local secrets - do not commit
+config.h
+secrets.h
 
 # Backend and Admin SDK secrets - do not commit
 *.serviceAccount.json
 serviceAccountKey.json
 firebase-adminsdk*.json
+credentials.json
 
 # Frontend Firebase Web Config is public configuration and belongs in:
 # tsunagari-care/src/js/firebase-config.js

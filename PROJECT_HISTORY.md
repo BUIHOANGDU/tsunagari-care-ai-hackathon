@@ -1,3 +1,183 @@
+# 2026-09-14 01:34:16 +09:00 - GitHub Secret Hygiene Prep
+
+## Goal
+
+Prepared the current copy of TsunagariCare for safer GitHub sharing without
+changing Chami, Smart Home, Fall Detection, Dashboard, Firebase, or backend
+business logic.
+
+## Files Changed
+
+- `.env.example`
+- `.gitignore`
+- `README.md`
+- `tsunagari-care/src/js/dashboard.js`
+- `PROJECT_HISTORY.md`
+
+## Secret and Config Changes
+
+- Removed the hard-coded frontend fallback device token from Dashboard command
+  requests. Dashboard can still use `window.TSUNAGARI_DEVICE_TOKEN` or
+  `localStorage.tsunagari_device_token` for local demos, but no default token is
+  committed.
+- Replaced `.env.example` sample values with empty placeholders only.
+- Added currently used backend environment variable names to `.env.example`:
+  Firebase Admin, device auth, LINE Messaging, family sessions, RTDB retention,
+  and weather settings.
+- Expanded root `.gitignore` for `.env`, `.env.*`, `config.h`, `secrets.h`,
+  service account JSON, credential JSON, build output, logs, and `.DS_Store`.
+- Confirmed firmware already uses `TsunagariCare_SmartHome_Bridge_Demo/config.h`
+  locally and publishes `config.example.h` with placeholders only.
+
+## Scan Results
+
+- No tracked `.env`, `config.h`, service account JSON, Firebase Admin SDK JSON,
+  or credential JSON file was found.
+- `TsunagariCare_SmartHome_Bridge_Demo/config.h` exists locally but is ignored.
+- Firebase Web Config remains in `tsunagari-care/src/js/firebase-config.js` as
+  public web app configuration; no Firebase Admin private key was found there.
+- Git history scan found keyword matches in docs/templates/frontend public config,
+  but no tracked secret file path such as `.env`, `config.h`, service account
+  JSON, or credential JSON.
+
+## Verification
+
+- `npm.cmd ci --ignore-scripts` passed after PowerShell `npm.ps1` was blocked by
+  local execution policy.
+- `node --check tsunagari-care/src/js/dashboard.js` passed.
+- `node --test server/lib/weatherService.test.js server/lib/rtdbRetentionService.test.js` passed.
+- Backend bootstrap check passed far enough to start Express on `PORT=0`; the
+  medicine scheduler then reported missing Firebase env vars, as expected in a
+  secret-free local checkout.
+- `git diff --check` passed.
+
+## Follow-Up Needed
+
+- Fill real values only in local `.env`, Render env vars, GitHub Actions secrets,
+  or local firmware `config.h`.
+- Do not commit `.env`, `config.h`, service account JSON, LINE tokens, device
+  tokens, family access codes, or private keys.
+- Review npm audit separately; dependency install reported 12 moderate
+  vulnerabilities in the existing dependency tree.
+
+# 2026-08-13 00:45:28 +09:00 - Smart Home V2 End-to-End ON/OFF State Sync Root Cause Fix
+
+## Goal
+
+Restored the canonical Smart Home V2 control-state path from ESP32 execution to
+Firebase and Dashboard rendering without using local fake state.
+
+## Root Cause
+
+- The running system symptoms match a bridge that does not yet publish
+  `smartHome.livingLight`, `smartHome.bedroomLight`, `smartHome.acPower`, and
+  `smartHome.acSetTemperature`; without those fields, Bedroom has no legacy
+  fallback and remains unknown.
+- The current source had already added the canonical `smartHome` payload and
+  backward-compatible server persistence, but firmware still waited for the
+  periodic 10-second environment sync after command or touch state changes.
+- Dashboard therefore could not receive a prompt authoritative Firebase update
+  after GPIO/TFT state changed.
+
+## Changes
+
+- Added a firmware dirty-state flag shared by Living, Bedroom, AC power, and AC
+  temperature setters, including idempotent explicit commands used to repair a
+  stale cloud state.
+- A changed state now schedules `/api/smart-home/device-status` for the next
+  eligible loop; failed immediate sync attempts retry after 5 seconds.
+- Kept the 10-second periodic environment/state sync as recovery and heartbeat.
+- Added concise command, executed-state, sync, server-persistence, and Dashboard
+  realtime logs that do not include credentials.
+- Dashboard semantic ON/OFF requests now send only the canonical command fields;
+  final state still comes exclusively from Firebase realtime data.
+- Unknown state remains disabled and emits one warning per missing bridge field.
+
+## Canonical State
+
+`devices/smart_home_001/smartHome` contains:
+
+- `livingLight`
+- `bedroomLight`
+- `acPower`
+- `acSetTemperature`
+- `updatedAt`
+
+The existing `devices/smart_home_001/environment` object remains unchanged and
+is sent in the same bridge status request.
+
+## Compatibility
+
+- Existing command polling, command ID dedupe, completion retry, BME280, TFT,
+  touch, GPIO mapping, feedback, and Wi-Fi reconnect flows remain intact.
+- Legacy `room_light_power`, `ac_cool_26`, `ac_off`, `ir_send`, and `ir_learn`
+  paths were not removed or remapped.
+- Old device-status payloads without `smartHome` remain valid and do not erase
+  an existing Smart Home state object.
+
+## Files Changed
+
+- `TsunagariCare_SmartHome_Bridge_Demo/TsunagariCare_SmartHome_Bridge_Demo.ino`
+- `server/routes/smartHome.js`
+- `tsunagari-care/src/js/dashboard.js`
+- `PROJECT_HISTORY.md`
+
+## Verification
+
+- `node --check` passed for Dashboard, Smart Home route, and command helper.
+- `git diff --check` passed.
+- PlatformIO ESP32 build passed using an external temporary config with the
+  registry-compatible unversioned XPT2046 package locator; the repository
+  `platformio.ini` still contains an invalid `^1.4` constraint and was not
+  changed as part of this state-sync fix.
+- Hardware, Firebase runtime, Dashboard-to-TFT, and TFT-to-Dashboard tests require
+  deploying the server/frontend changes and uploading the ESP32 firmware.
+
+# 2026-08-12 23:38:45 +09:00 - Smart Home V2 Dashboard ON/OFF Button State Fix
+
+## Goal
+
+Fixed the main Dashboard Smart Home V2 ON/OFF button behavior so button labels
+and command actions come from normalized real device state instead of treating
+unknown state as OFF.
+
+## Root Cause
+
+- Dashboard normalized Smart Home V2 state only from `devices/smart_home_001.smartHome`.
+- If the bridge state arrived in another compatible shape such as
+  `devices/smart_home_001.devices` or flat bridge fields, the UI produced
+  `unknown`.
+- The previous V2 button helper treated every non-`on` state, including
+  `unknown`, as "turn on", so cards could look stuck on ON actions.
+
+## Change
+
+- Extended Dashboard state normalization to read compatible bridge state shapes:
+  `smartHome`, `devices`, and flat bridge fields.
+- Added a single presentation helper for Smart Home V2 cards:
+  status text, button text, known/unknown state, and `nextAction`.
+- Unknown V2 states now show the existing `unknown` i18n label and disable the
+  button instead of sending a guessed `on` command.
+- Known V2 states map:
+  - `on` -> button OFF -> command action `off`
+  - `off` -> button ON -> command action `on`
+
+## Files Changed
+
+- `tsunagari-care/src/js/dashboard.js`
+- `PROJECT_HISTORY.md`
+
+## Compatibility
+
+- No endpoint, Firebase root schema, server route, firmware GPIO, TFT/touch,
+  BME280, Chami, Fall Detection, Alerts, Medicine, LINE, weather, or legacy IR
+  behavior was changed.
+- Legacy IR paths remain available outside the main semantic V2 cards.
+
+## Checks
+
+- `node --check tsunagari-care/src/js/dashboard.js` passed.
+
 # 2026-08-12 02:28:33 +09:00 - Smart Home V2 Dashboard Device State Sync
 
 ## Goal
