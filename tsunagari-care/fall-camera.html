@@ -64,9 +64,26 @@
             <button id="reset-fall-state" class="secondary" type="button">
               Reset Fall State
             </button>
+            <button id="configure-zones" class="secondary" type="button">
+              Configure Zones
+            </button>
+            <button id="clear-zones" class="secondary" type="button">
+              Clear Zone Configuration
+            </button>
             <button id="clear-log" class="secondary" type="button">
               Clear Local Log
             </button>
+          </div>
+          <div id="zone-toolbar" class="zone-toolbar hidden" aria-label="Zone controls">
+            <select id="zone-type" aria-label="Zone type">
+              <option value="bed">Bed</option>
+              <option value="sofa">Sofa</option>
+              <option value="floor">Floor</option>
+            </select>
+            <button id="save-zone" class="primary" type="button" disabled>
+              Save Zone
+            </button>
+            <button id="cancel-zone" type="button">Cancel</button>
           </div>
           <p
             id="fall-command-status"
@@ -103,12 +120,24 @@
                 <dd id="fall-status">Normal</dd>
               </div>
               <div>
-                <dt>Lying duration</dt>
-                <dd id="lying-duration">0.0s / 3.0s</dd>
+                <dt>Warm-up</dt>
+                <dd id="warmup-status">Idle</dd>
               </div>
               <div>
-                <dt>Fall confidence</dt>
-                <dd id="fall-confidence">0% (demo)</dd>
+                <dt>Verification</dt>
+                <dd id="lying-duration">0.0s / 5.0s</dd>
+              </div>
+              <div>
+                <dt>Fall score</dt>
+                <dd id="fall-confidence">0 pts</dd>
+              </div>
+              <div>
+                <dt>Active zone</dt>
+                <dd id="active-zone">None</dd>
+              </div>
+              <div>
+                <dt>Safe zones</dt>
+                <dd id="safe-zone-status">Not configured</dd>
               </div>
               <div>
                 <dt>Cooldown</dt>
@@ -146,6 +175,8 @@
     <script src="src/js/firebase-config.js"></script>
     <script src="src/js/firebase-service.js"></script>
     <script src="src/js/webrtc-signaling.js"></script>
+    <script src="src/js/fall-zone-manager.js"></script>
+    <script src="src/js/fall-detection-engine.js"></script>
     <script src="fall-camera.js"></script>
   </body>
 </html>

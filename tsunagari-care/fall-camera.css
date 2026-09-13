@@ -277,6 +277,11 @@ h2 {
   pointer-events: none;
 }
 
+#camera-overlay.zone-editing {
+  cursor: crosshair;
+  pointer-events: auto;
+}
+
 .empty-camera-state {
   align-items: center;
   color: rgba(255, 255, 255, 0.72);
@@ -297,6 +302,30 @@ h2 {
   align-items: center;
   gap: 8px;
   margin-top: 10px;
+}
+
+.zone-toolbar {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.zone-toolbar.hidden {
+  display: none;
+}
+
+.zone-toolbar select {
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.84rem;
+  font-weight: 800;
+  padding: 8px 10px;
 }
 
 .camera-inline-status {
@@ -357,7 +386,7 @@ h2 {
   padding: 9px 10px;
 }
 
-.status-grid div:nth-child(9) {
+.status-grid div:nth-child(12) {
   grid-column: 1 / -1;
 }
 
@@ -521,11 +550,16 @@ h2 {
     flex-direction: column;
   }
 
+  .zone-toolbar,
+  .zone-toolbar select {
+    width: 100%;
+  }
+
   .status-grid {
     grid-template-columns: 1fr;
   }
 
-  .status-grid div:nth-child(9) {
+  .status-grid div:nth-child(12) {
     grid-column: auto;
   }
 

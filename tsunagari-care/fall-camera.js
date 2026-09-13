@@ -3,17 +3,24 @@
   const LOCATION = "living_room";
   const LOG_KEY = "tsunagari_fall_camera_log";
   const MAX_LOCAL_LOG_ITEMS = 20;
+  const FALL_DETECTION_CONFIG =
+    window.TsunagariFallDetectionEngine?.defaultConfig || {
+      cameraWarmupMs: 8000,
+      minLandmarkVisibility: 0.55,
+      minRenderableLandmarks: 8,
+      poseHistoryWindowMs: 4000,
+      postFallVerifyMs: 5000,
+      robotResponseTimeoutMs: 12000,
+      alertCooldownMs: 90000,
+    };
   const DETECTION_INTERVAL_MS = 200;
-  const LYING_DURATION_LOG_INTERVAL_MS = 1000;
-  const SUSPECTED_FALL_MS = 1500;
-  // Demo threshold. Real deployments may prefer 5000-10000 ms.
-  const CONFIRMED_FALL_MS = 3000;
-  const FALL_ALERT_COOLDOWN_MS = 30000;
-  const FALL_EMERGENCY_COOLDOWN_MS = 30000;
-  const FALL_RESET_GRACE_MS = 1500;
-  const MIN_FALL_CONFIDENCE = 0.7;
-  const MIN_VALID_LANDMARKS = 12;
-  const MIN_LANDMARK_VISIBILITY = 0.5;
+  const CONFIRMED_FALL_MS = FALL_DETECTION_CONFIG.postFallVerifyMs;
+  const FALL_ALERT_COOLDOWN_MS = FALL_DETECTION_CONFIG.alertCooldownMs;
+  const FALL_EMERGENCY_COOLDOWN_MS = FALL_DETECTION_CONFIG.alertCooldownMs;
+  const MIN_VALID_LANDMARKS =
+    FALL_DETECTION_CONFIG.minRenderableLandmarks || 8;
+  const MIN_LANDMARK_VISIBILITY =
+    FALL_DETECTION_CONFIG.minLandmarkVisibility || 0.55;
   const CHAMI_EMERGENCY_TARGET = "chami_001";
   const CHAMI_EMERGENCY_ACTION = "emergency_check";
   const CHAMI_EMERGENCY_TEXT =
@@ -43,6 +50,21 @@
     [30, 32],
   ];
   const FALL_STAGE_LABELS = {
+    INITIALIZING: "Calibrating",
+    NO_PERSON: "No Person",
+    POSE_UNCERTAIN: "Pose Uncertain",
+    NORMAL: "Normal",
+    BENDING: "Bending",
+    SITTING: "Sitting",
+    CONTROLLED_DESCENT: "Controlled Descent",
+    CONTROLLED_LYING: "Controlled Lying",
+    SLEEPING: "Safe Resting",
+    FALL_CANDIDATE: "Fall Candidate",
+    VERIFYING: "Verifying",
+    CONFIRMED_FALL: "Confirmed Fall",
+    RECOVERING: "Recovering",
+    RECOVERED: "Recovered",
+    COOLDOWN: "Cooldown",
     normal: "Normal",
     suspected_fall: "Suspected Fall",
     confirmed_fall: "Confirmed Fall",
@@ -50,6 +72,21 @@
     cooldown: "Cooldown",
   };
   const FALL_STAGE_TONES = {
+    INITIALIZING: "accent",
+    NO_PERSON: "normal",
+    POSE_UNCERTAIN: "warning",
+    NORMAL: "success",
+    BENDING: "accent",
+    SITTING: "success",
+    CONTROLLED_DESCENT: "accent",
+    CONTROLLED_LYING: "success",
+    SLEEPING: "success",
+    FALL_CANDIDATE: "warning",
+    VERIFYING: "warning",
+    CONFIRMED_FALL: "danger",
+    RECOVERING: "accent",
+    RECOVERED: "success",
+    COOLDOWN: "accent",
     normal: "success",
     suspected_fall: "warning",
     confirmed_fall: "danger",
@@ -65,6 +102,12 @@
   const testFallAlertButton = document.getElementById("test-fall-alert");
   const resetFallStateButton = document.getElementById("reset-fall-state");
   const clearLogButton = document.getElementById("clear-log");
+  const configureZonesButton = document.getElementById("configure-zones");
+  const clearZonesButton = document.getElementById("clear-zones");
+  const zoneToolbar = document.getElementById("zone-toolbar");
+  const zoneTypeSelect = document.getElementById("zone-type");
+  const saveZoneButton = document.getElementById("save-zone");
+  const cancelZoneButton = document.getElementById("cancel-zone");
   const logList = document.getElementById("local-log");
   const fallCommandStatus = document.getElementById("fall-command-status");
   const cameraStatus = document.getElementById("camera-status");
@@ -75,6 +118,9 @@
   const fallStatus = document.getElementById("fall-status");
   const lyingDurationStatus = document.getElementById("lying-duration");
   const fallConfidenceStatus = document.getElementById("fall-confidence");
+  const warmupStatus = document.getElementById("warmup-status");
+  const activeZoneStatus = document.getElementById("active-zone");
+  const safeZoneStatus = document.getElementById("safe-zone-status");
   const cooldownStatus = document.getElementById("cooldown-status");
   const lastChamiCommandStatus = document.getElementById("last-chami-command");
 
@@ -107,9 +153,23 @@
   let currentChamiCommandId = null;
   let currentFallFlowId = null;
   let fallConfirmedCareEventWritten = false;
+  let robotVerificationStartedAt = null;
+  let robotVerificationUnavailable = false;
+  let latestFallDetectionResult = null;
+  let currentFallScore = 0;
+  let zoneEditing = false;
+  let zoneDragStart = null;
+  let zoneDraftRect = null;
   let fallCameraPublisher = null;
   const fallCameraPublisherUnsubscribes = [];
   const fallCameraPublisherErrorCounts = new Map();
+  const zoneManager = window.TsunagariFallZoneManager?.createZoneManager
+    ? window.TsunagariFallZoneManager.createZoneManager()
+    : null;
+  const fallDetectionEngine =
+    window.TsunagariFallDetectionEngine?.createFallDetectionEngine
+      ? window.TsunagariFallDetectionEngine.createFallDetectionEngine()
+      : null;
 
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
@@ -454,44 +514,81 @@
     return lyingStartAt ? Math.max(0, now - lyingStartAt) : 0;
   }
 
-  function calculateDemoFallConfidence(hasPerson, stage, lyingDurationMs) {
-    // Demo confidence only. This is not a true ML probability.
-    if (!hasPerson) return 0;
+  function getVerificationDurationMs(now = Date.now()) {
+    return currentFallFlowId && lyingStartAt ? Math.max(0, now - lyingStartAt) : 0;
+  }
 
-    if (stage === "normal") return 20;
+  function updateWarmupStatus(remainingMs = 0) {
+    if (!warmupStatus) return;
 
-    if (stage === "cooldown") return 30;
-
-    if (stage === "suspected_fall") {
-      const progress = clamp(lyingDurationMs / CONFIRMED_FALL_MS, 0, 1);
-      return Math.round(40 + progress * 40);
+    if (remainingMs > 0) {
+      warmupStatus.textContent = `${Math.ceil(remainingMs / 1000)}s`;
+      setStatusTone(warmupStatus, "accent");
+      return;
     }
 
-    return 95;
+    warmupStatus.textContent = stream ? "Complete" : "Idle";
+    setStatusTone(warmupStatus, stream ? "success" : "");
+  }
+
+  function updateZoneStatus(zone = "none") {
+    if (activeZoneStatus) {
+      activeZoneStatus.textContent =
+        zone && zone !== "none" ? zone.replace("_", " ") : "None";
+      setStatusTone(
+        activeZoneStatus,
+        zone === "bed" || zone === "sofa"
+          ? "success"
+          : zone === "floor" || zone === "fallback_floor"
+            ? "warning"
+            : "",
+      );
+    }
+
+    if (!safeZoneStatus) return;
+
+    const summary = zoneManager ? zoneManager.getSummary() : "Not configured";
+    safeZoneStatus.textContent = summary;
+    setStatusTone(
+      safeZoneStatus,
+      zoneManager && (zoneManager.hasZone("bed") || zoneManager.hasZone("sofa"))
+        ? "success"
+        : "warning",
+    );
   }
 
   function updateFallProgressUI({
     hasPerson = lastPersonDetected,
-    lyingDurationMs = getCurrentLyingDuration(),
+    lyingDurationMs = getVerificationDurationMs(),
     stage = currentFallStage,
     now = Date.now(),
+    score = currentFallScore,
+    warmupRemainingMs = 0,
+    verificationRemainingMs = 0,
+    zone = latestFallDetectionResult?.zone || "none",
   } = {}) {
     const targetSeconds = (CONFIRMED_FALL_MS / 1000).toFixed(1);
-    const currentSeconds = hasPerson
-      ? (lyingDurationMs / 1000).toFixed(1)
-      : "0.0";
-    const demoConfidence = calculateDemoFallConfidence(
-      hasPerson,
-      stage,
-      lyingDurationMs,
-    );
-
-    lyingDurationStatus.textContent = `${currentSeconds}s / ${targetSeconds}s`;
-    fallConfidenceStatus.textContent = `${demoConfidence}% (demo)`;
+    if (verificationRemainingMs > 0) {
+      lyingDurationStatus.textContent = `${Math.ceil(verificationRemainingMs / 1000)}s left`;
+    } else {
+      const currentSeconds = hasPerson
+        ? (lyingDurationMs / 1000).toFixed(1)
+        : "0.0";
+      lyingDurationStatus.textContent = `${currentSeconds}s / ${targetSeconds}s`;
+    }
+    fallConfidenceStatus.textContent = `${Math.max(0, score)} pts`;
     setStatusTone(
       fallConfidenceStatus,
-      FALL_STAGE_TONES[stage] || (hasPerson ? "normal" : "normal"),
+      score >= FALL_DETECTION_CONFIG.confirmedFallScoreThreshold
+        ? "danger"
+        : score >= FALL_DETECTION_CONFIG.fallCandidateScoreThreshold
+          ? "warning"
+          : hasPerson
+            ? "normal"
+            : "",
     );
+    updateWarmupStatus(warmupRemainingMs);
+    updateZoneStatus(zone);
     updateCooldownUI(now);
   }
 
@@ -502,6 +599,10 @@
       lyingDurationMs = getCurrentLyingDuration(),
       fallStatusText = FALL_STAGE_LABELS[stage] || "Normal",
       now = Date.now(),
+      score = currentFallScore,
+      warmupRemainingMs = 0,
+      verificationRemainingMs = 0,
+      zone = latestFallDetectionResult?.zone || "none",
     } = {},
   ) {
     currentFallStage = stage;
@@ -513,7 +614,16 @@
     setStatusTone(detectionStage, tone);
     setStatusTone(fallStatus, tone);
 
-    updateFallProgressUI({ hasPerson, lyingDurationMs, stage, now });
+    updateFallProgressUI({
+      hasPerson,
+      lyingDurationMs,
+      stage,
+      now,
+      score,
+      warmupRemainingMs,
+      verificationRemainingMs,
+      zone,
+    });
   }
 
   function refreshIdleStage(now = Date.now(), hasPerson = lastPersonDetected) {
@@ -526,10 +636,10 @@
       !currentFallEventConfirmed &&
       !chamiCheckSentForCurrentEvent
     ) {
-      if (currentFallStage !== "cooldown") {
+      if (currentFallStage !== "COOLDOWN") {
         logCameraEvent("FallCamera: fall emergency cooldown active");
       }
-      setFallStage("cooldown", {
+      setFallStage("COOLDOWN", {
         hasPerson,
         lyingDurationMs: 0,
         fallStatusText: "Cooldown",
@@ -538,7 +648,7 @@
       return;
     }
 
-    setFallStage("normal", {
+    setFallStage("NORMAL", {
       hasPerson,
       lyingDurationMs: 0,
       fallStatusText: "Normal",
@@ -630,6 +740,9 @@
       cameraId: CAMERA_ID,
       location: LOCATION,
     };
+    if (typeof extra.score === "number") payload.score = extra.score;
+    if (Array.isArray(extra.reasons)) payload.reasons = extra.reasons;
+    if (extra.zone) payload.zone = extra.zone;
 
     try {
       const firebaseService = getFirebaseService();
@@ -656,7 +769,7 @@
     }
   }
 
-  async function handleFallConfirmed() {
+  async function handleFallConfirmedLegacy() {
     logCameraEvent("Fall confirmed by camera");
 
     if (fallEmergencyCommandPending) {
@@ -758,6 +871,112 @@
     }
   }
 
+  async function requestRobotFallVerification(detectionResult) {
+    if (
+      chamiCheckSentForCurrentEvent ||
+      fallEmergencyCommandPending ||
+      getCooldownRemainingMs() > 0
+    ) {
+      return;
+    }
+
+    fallEmergencyCommandPending = true;
+    robotVerificationStartedAt = Date.now();
+    getOrCreateFallFlowId();
+
+    try {
+      logCameraEvent("Creating Chami fall verification command");
+      const command = await createChamiEmergencyCheckCommand();
+      lastFallEmergencyCommandAt = Date.now();
+      chamiCheckSentForCurrentEvent = true;
+      currentChamiCommandId = command && command.id ? command.id : null;
+      robotVerificationUnavailable = false;
+      updateLastChamiCommandStatus(
+        currentChamiCommandId
+          ? `Verification: ${currentChamiCommandId}`
+          : "Verification requested",
+        "warning",
+      );
+      setFallCommandStatus("Chami verification requested", "warning");
+      writeFallResponseCareEvent(
+        "fall_verification_requested",
+        "warning",
+        "Camera is verifying a fall candidate",
+        "Chami emergency_check command was requested before danger alert",
+        {
+          relatedCommandId: currentChamiCommandId || "",
+          score: detectionResult?.score || 0,
+          reasons: detectionResult?.reasons || [],
+          zone: detectionResult?.zone || "none",
+        },
+      );
+    } catch (error) {
+      robotVerificationUnavailable = true;
+      logCameraEvent("robot verification unavailable", "warn", error);
+      updateLastChamiCommandStatus("Verification unavailable", "warning");
+      setFallCommandStatus(
+        "Robot verification unavailable; using visual verification fallback",
+        "warning",
+      );
+    } finally {
+      fallEmergencyCommandPending = false;
+    }
+  }
+
+  function canDispatchConfirmedFall(detectionResult, now = Date.now()) {
+    if (!detectionResult || detectionResult.alertLevel !== "confirmed_fall") {
+      return false;
+    }
+
+    if (currentFallEventConfirmed || fallAlertCreatePending) return false;
+    if (getCooldownRemainingMs(now) > 0 && !fallEventActive) return false;
+
+    if (!chamiCheckSentForCurrentEvent || robotVerificationUnavailable) {
+      return true;
+    }
+
+    return (
+      robotVerificationStartedAt &&
+      now - robotVerificationStartedAt >= FALL_DETECTION_CONFIG.robotResponseTimeoutMs
+    );
+  }
+
+  async function handleFallConfirmed(detectionResult = null) {
+    logCameraEvent("Fall confirmed by camera");
+
+    getOrCreateFallFlowId();
+    if (!fallConfirmedCareEventWritten) {
+      fallConfirmedCareEventWritten = true;
+      writeFallResponseCareEvent(
+        "fall_confirmed",
+        "danger",
+        "Camera confirmed fall risk",
+        "Visual verification stayed positive after recovery and safe-zone checks",
+        {
+          score: detectionResult?.score || currentFallScore,
+          reasons: detectionResult?.reasons || [],
+          zone: detectionResult?.zone || "none",
+        },
+      );
+    }
+
+    if (chamiCheckSentForCurrentEvent) {
+      updateLastChamiCommandStatus(
+        currentChamiCommandId
+          ? `No response: ${currentChamiCommandId}`
+          : "No robot response",
+        "warning",
+      );
+      setFallCommandStatus(
+        "Confirmed after visual verification and robot timeout",
+        "danger",
+      );
+      return;
+    }
+
+    await requestRobotFallVerification(detectionResult);
+  }
+
   function markCurrentFallAlertConfirmedIfNeeded() {
     if (
       !currentFallAlertId ||
@@ -777,13 +996,14 @@
     });
   }
 
-  function confirmFallFromCamera(now = Date.now()) {
+  async function confirmFallFromCamera(now = Date.now(), detectionResult = null) {
     if (currentFallEventConfirmed) {
       return;
     }
 
     currentFallEventConfirmed = true;
-    setFallStage("confirmed_fall", {
+    currentFallScore = detectionResult?.score || currentFallScore;
+    setFallStage("CONFIRMED_FALL", {
       hasPerson: true,
       lyingDurationMs: getCurrentLyingDuration(now),
       fallStatusText: "Confirmed Fall",
@@ -791,8 +1011,31 @@
     });
     logCameraEvent("FallCamera: confirmed fall threshold reached");
     logCameraEvent("FallCamera: real camera confirmed fall");
-    handleFallConfirmed();
-    markCurrentFallAlertConfirmedIfNeeded();
+    fallAlertCreatePending = true;
+
+    const alertId = await sendFallAlert(
+      "confirmed",
+      detectionResult || latestFallDetectionResult,
+      getVerificationDurationMs(now),
+      {
+        eventId: detectionResult?.event?.eventId || currentFallFlowId,
+        source: "fall_camera",
+        verificationResponse: chamiCheckSentForCurrentEvent
+          ? "no_response"
+          : "robot_unavailable",
+      },
+    );
+
+    fallAlertCreatePending = false;
+    if (alertId) {
+      currentFallAlertId = alertId;
+      nextFallEventAllowedAt = Math.max(
+        nextFallEventAllowedAt,
+        now + FALL_ALERT_COOLDOWN_MS,
+      );
+    }
+
+    handleFallConfirmed(detectionResult);
   }
 
   function setCameraOnline(isOnline) {
@@ -910,6 +1153,130 @@
     context.strokeStyle = "rgba(255, 255, 255, 0.42)";
     context.lineWidth = 2;
     context.strokeRect(12, 12, canvas.width - 24, canvas.height - 24);
+
+    drawZones(context);
+  }
+
+  function getZoneColor(type) {
+    if (type === "bed") return "rgba(19, 138, 97, 0.72)";
+    if (type === "sofa") return "rgba(36, 87, 197, 0.72)";
+    return "rgba(201, 58, 58, 0.72)";
+  }
+
+  function drawZoneRect(context, zone, dashed = false) {
+    if (!zone || !Array.isArray(zone.points) || zone.points.length < 4) return;
+
+    const xs = zone.points.map((point) => point.x * canvas.width);
+    const ys = zone.points.map((point) => point.y * canvas.height);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const color = getZoneColor(zone.type);
+
+    context.save();
+    context.strokeStyle = color;
+    context.fillStyle = color.replace("0.72", "0.12");
+    context.lineWidth = Math.max(2, canvas.width * 0.003);
+    if (dashed) context.setLineDash([8, 6]);
+    context.fillRect(minX, minY, maxX - minX, maxY - minY);
+    context.strokeRect(minX, minY, maxX - minX, maxY - minY);
+    context.fillStyle = "rgba(255, 255, 255, 0.92)";
+    context.font = `${Math.max(12, canvas.width * 0.016)}px Inter, sans-serif`;
+    context.fillText(zone.type.toUpperCase(), minX + 8, minY + 18);
+    context.restore();
+  }
+
+  function drawZones(context) {
+    if (zoneManager) {
+      zoneManager.getZones().forEach((zone) => drawZoneRect(context, zone));
+    }
+
+    if (zoneDraftRect && zoneTypeSelect) {
+      const points = window.TsunagariFallZoneManager?.rectToPoints(zoneDraftRect);
+      if (points) {
+        drawZoneRect(context, { type: zoneTypeSelect.value, points }, true);
+      }
+    }
+  }
+
+  function setZoneEditing(enabled) {
+    zoneEditing = enabled;
+    zoneDragStart = null;
+    zoneDraftRect = null;
+    canvas.classList.toggle("zone-editing", enabled);
+    zoneToolbar?.classList.toggle("hidden", !enabled);
+    if (saveZoneButton) saveZoneButton.disabled = true;
+    drawOverlay();
+  }
+
+  function getNormalizedCanvasPoint(event) {
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+
+    return {
+      x: clamp((event.clientX - rect.left) / rect.width, 0, 1),
+      y: clamp((event.clientY - rect.top) / rect.height, 0, 1),
+    };
+  }
+
+  function handleZonePointerDown(event) {
+    if (!zoneEditing) return;
+    const point = getNormalizedCanvasPoint(event);
+    if (!point) return;
+
+    zoneDragStart = point;
+    zoneDraftRect = {
+      startX: point.x,
+      startY: point.y,
+      endX: point.x,
+      endY: point.y,
+    };
+    canvas.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  }
+
+  function handleZonePointerMove(event) {
+    if (!zoneEditing || !zoneDragStart || !zoneDraftRect) return;
+    const point = getNormalizedCanvasPoint(event);
+    if (!point) return;
+
+    zoneDraftRect.endX = point.x;
+    zoneDraftRect.endY = point.y;
+    if (saveZoneButton) {
+      const width = Math.abs(zoneDraftRect.endX - zoneDraftRect.startX);
+      const height = Math.abs(zoneDraftRect.endY - zoneDraftRect.startY);
+      saveZoneButton.disabled = width < 0.03 || height < 0.03;
+    }
+    drawOverlay();
+    event.preventDefault();
+  }
+
+  function handleZonePointerUp(event) {
+    if (!zoneEditing) return;
+    canvas.releasePointerCapture?.(event.pointerId);
+    zoneDragStart = null;
+    event.preventDefault();
+  }
+
+  function saveCurrentZone() {
+    if (!zoneManager || !zoneDraftRect || !zoneTypeSelect) return;
+
+    zoneManager.addRectangle(zoneTypeSelect.value, zoneDraftRect);
+    addLog(`Zone saved: ${zoneTypeSelect.value}`);
+    setFallCommandStatus("Zone configuration saved locally", "success");
+    updateZoneStatus(latestFallDetectionResult?.zone || "none");
+    setZoneEditing(false);
+  }
+
+  function clearZoneConfiguration() {
+    if (!zoneManager) return;
+
+    zoneManager.clear();
+    addLog("Zone configuration cleared");
+    setFallCommandStatus("Zone configuration cleared", "warning");
+    updateZoneStatus("none");
+    drawOverlay();
   }
 
   function isValidLandmark(landmark) {
@@ -984,7 +1351,19 @@
     };
   }
 
-  function updatePoseStatus(postureInfo) {
+  function getEnginePostureLabel(posture) {
+    const labels = {
+      standing: "Standing",
+      sitting: "Sitting",
+      bending: "Bending",
+      lying: "Lying",
+      unknown: "Unknown",
+    };
+
+    return labels[posture] || null;
+  }
+
+  function updatePoseStatus(postureInfo, detectionResult = null) {
     if (!postureInfo.hasPerson) {
       lastPersonDetected = false;
       personStatus.textContent = "No person";
@@ -998,138 +1377,119 @@
 
     lastPersonDetected = true;
     personStatus.textContent = "Person detected";
-    postureStatus.textContent = postureInfo.posture;
+    postureStatus.textContent =
+      getEnginePostureLabel(detectionResult?.posture) || postureInfo.posture;
   }
 
-  function handleFallDetection(postureInfo, now = Date.now()) {
+  function handleFallDetection(detectionResult, postureInfo, now = Date.now()) {
     updateCooldownUI(now);
 
-    if (!postureInfo.hasPerson || postureInfo.posture !== "Lying") {
-      const hadActiveSequence =
-        lyingStartAt ||
-        fallEventActive ||
-        currentFallAlertId ||
-        currentFallEventConfirmed ||
-        chamiCheckSentForCurrentEvent;
-
-      if (hadActiveSequence) {
-        if (!fallExitStartedAt) {
-          fallExitStartedAt = now;
-        }
-
-        if (now - fallExitStartedAt >= FALL_RESET_GRACE_MS) {
-          resetFallEvent(now, true, "recovery");
-        } else {
-          refreshIdleStage(now, postureInfo.hasPerson);
-          updateFallProgressUI({
-            hasPerson: postureInfo.hasPerson,
-            lyingDurationMs: 0,
-            stage: currentFallStage,
-            now,
-          });
-        }
-      } else {
-        fallExitStartedAt = null;
-        refreshIdleStage(now, postureInfo.hasPerson);
-        updateFallProgressUI({
-          hasPerson: postureInfo.hasPerson,
-          lyingDurationMs: 0,
-          stage: currentFallStage,
-          now,
-        });
-      }
-
+    if (!fallDetectionEngine || !detectionResult) {
+      refreshIdleStage(now, postureInfo.hasPerson);
       return;
     }
 
-    fallExitStartedAt = null;
+    latestFallDetectionResult = detectionResult;
+    currentFallScore = detectionResult.score || 0;
 
-    if (!lyingStartAt) {
-      lyingStartAt = now;
-      lastLyingDurationLoggedAt = 0;
-      suspectedFallLogged = false;
-      logCameraEvent("FallCamera: lying candidate started");
-    }
-
-    const lyingDuration = now - lyingStartAt;
-    const confidence = clamp(postureInfo.confidence || 0, 0, 1);
-
-    if (
-      !lastLyingDurationLoggedAt ||
-      now - lastLyingDurationLoggedAt >= LYING_DURATION_LOG_INTERVAL_MS
-    ) {
-      lastLyingDurationLoggedAt = now;
-      logCameraEvent(`FallCamera: lying duration ms=${lyingDuration}`);
-    }
-
-    if (!suspectedFallLogged) {
-      suspectedFallLogged = true;
-      logCameraEvent("FallCamera: suspected fall");
-    }
-
-    if (chamiCheckSentForCurrentEvent) {
-      setFallStage("chami_check_sent", {
-        hasPerson: true,
-        lyingDurationMs: lyingDuration,
-        fallStatusText: "Chami Check Sent",
-        now,
-      });
-    } else if (currentFallEventConfirmed) {
-      setFallStage("confirmed_fall", {
-        hasPerson: true,
-        lyingDurationMs: lyingDuration,
-        fallStatusText: "Confirmed Fall",
-        now,
-      });
-    } else {
-      setFallStage("suspected_fall", {
-        hasPerson: true,
-        lyingDurationMs: lyingDuration,
-        fallStatusText: "Suspected Fall",
-        now,
-      });
+    if (detectionResult.transition) {
+      logCameraEvent(
+        `State transition ${detectionResult.transition.from} -> ${detectionResult.transition.to}`,
+      );
     }
 
     if (
-      lyingDuration >= SUSPECTED_FALL_MS &&
-      confidence >= MIN_FALL_CONFIDENCE &&
+      detectionResult.alertLevel === "fall_candidate" &&
       !fallEventActive &&
-      !fallAlertCreatePending &&
       now >= nextFallEventAllowedAt
     ) {
-      const eventGeneration = fallEventGeneration;
       fallEventActive = true;
-      fallAlertCreatePending = true;
-      addLog("Fall event started: suspected");
+      lyingStartAt = detectionResult.event?.candidateStartedAt || now;
+      currentFallFlowId = detectionResult.event?.eventId || getOrCreateFallFlowId();
+      suspectedFallLogged = true;
+      addLog(
+        `Fall candidate score=${detectionResult.score} reasons=${detectionResult.reasons.join(",")} zone=${detectionResult.zone}`,
+      );
+    }
 
-      sendFallAlert("suspected", postureInfo, lyingDuration).then((alertId) => {
-        fallAlertCreatePending = false;
+    if (
+      (detectionResult.state === "FALL_CANDIDATE" ||
+        detectionResult.state === "VERIFYING") &&
+      fallEventActive &&
+      !chamiCheckSentForCurrentEvent &&
+      !robotVerificationUnavailable
+    ) {
+      requestRobotFallVerification(detectionResult);
+    }
 
-        if (eventGeneration !== fallEventGeneration) return;
-
-        if (!alertId) {
-          resetFallEvent(Date.now(), true, "alert_failed");
-          return;
-        }
-
-        currentFallAlertId = alertId;
-        addLog(`Fall alert created: ${alertId}`);
-        markCurrentFallAlertConfirmedIfNeeded();
+    if (detectionResult.alertLevel === "recovered") {
+      addLog("Fall candidate recovered");
+      setFallCommandStatus("Candidate recovered; no danger alert sent", "success");
+      resetFallEvent(now, true, "recovery");
+      setFallStage("RECOVERED", {
+        hasPerson: postureInfo.hasPerson,
+        lyingDurationMs: 0,
+        fallStatusText: "Recovered",
+        now,
+        score: 0,
+        zone: detectionResult.zone,
       });
+      return;
     }
 
-    if (lyingDuration >= CONFIRMED_FALL_MS) {
-      confirmFallFromCamera(now);
+    if (canDispatchConfirmedFall(detectionResult, now)) {
+      confirmFallFromCamera(now, detectionResult);
+      return;
     }
+
+    const stage =
+      currentFallEventConfirmed && detectionResult.state !== "COOLDOWN"
+        ? "CONFIRMED_FALL"
+        : detectionResult.state;
+    const verificationRemainingMs =
+      chamiCheckSentForCurrentEvent && robotVerificationStartedAt
+        ? Math.max(
+            detectionResult.verificationRemainingMs || 0,
+            FALL_DETECTION_CONFIG.robotResponseTimeoutMs -
+              (now - robotVerificationStartedAt),
+          )
+        : detectionResult.verificationRemainingMs || 0;
+
+    setFallStage(stage, {
+      hasPerson: postureInfo.hasPerson,
+      lyingDurationMs: getVerificationDurationMs(now),
+      fallStatusText: FALL_STAGE_LABELS[stage] || stage,
+      now,
+      score: detectionResult.score,
+      warmupRemainingMs: detectionResult.warmupRemainingMs || 0,
+      verificationRemainingMs,
+      zone: detectionResult.zone,
+    });
   }
 
-  async function sendFallAlert(status, postureInfo, lyingDuration) {
+  async function sendFallAlert(status, postureInfo, lyingDuration, options = {}) {
     const confidence = Math.max(
       0,
-      Math.min(1, Number((postureInfo.confidence || 0.7).toFixed(2))),
+      Math.min(
+        1,
+        Number(
+          (
+            postureInfo.confidence ||
+            postureInfo.sample?.poseConfidence ||
+            0.7
+          ).toFixed(2),
+        ),
+      ),
     );
-    const ratio = Number((postureInfo.bodyRatio || 0).toFixed(2));
+    const ratio = Number(
+      (postureInfo.bodyRatio ||
+        postureInfo.sample?.bodyAspectRatio ||
+        0).toFixed(2),
+    );
     const seconds = Math.round(lyingDuration / 1000);
+    const score = postureInfo.score || 0;
+    const reasons = Array.isArray(postureInfo.reasons) ? postureInfo.reasons : [];
+    const zone = postureInfo.zone || "none";
 
     try {
       const db = getFirestoreOrThrow();
@@ -1138,12 +1498,28 @@
         location: LOCATION,
         type: "fall_detected",
         status,
+        severity: status === "confirmed" ? "danger" : "warning",
         confidence,
+        score,
+        reasons,
+        zone,
         source: "webcam",
+        eventId: options.eventId || postureInfo.event?.eventId || "",
+        alertSent: status === "confirmed",
+        isTest: Boolean(options.isTest),
+        sourceDetail: options.source || "fall_camera",
         aiModel: "mediapipe_pose_landmarker",
         createdAt: getServerTimestamp(),
+        confirmedAt: status === "confirmed" ? getServerTimestamp() : null,
         resolvedAt: null,
-        note: `MediaPipe detected lying posture for ${seconds}s, body ratio ${ratio}`,
+        verification: {
+          robotAsked: Boolean(chamiCheckSentForCurrentEvent),
+          response: options.verificationResponse || "visual_only",
+        },
+        note:
+          status === "confirmed"
+            ? `Verified fall event after ${seconds}s, score ${score}, body ratio ${ratio}`
+            : `Fall candidate score ${score}, body ratio ${ratio}`,
       });
       const message = `Auto fall alert sent (${status}): ${docRef.id}`;
       addLog(message);
@@ -1197,6 +1573,10 @@
     chamiCheckSentForCurrentEvent = false;
     currentFallFlowId = null;
     fallConfirmedCareEventWritten = false;
+    robotVerificationStartedAt = null;
+    robotVerificationUnavailable = false;
+    latestFallDetectionResult = null;
+    currentFallScore = 0;
     fallExitStartedAt = null;
     confirmedUpdateSent = false;
     confirmedUpdatePending = false;
@@ -1221,6 +1601,29 @@
       lyingDurationMs: 0,
       stage: currentFallStage,
       now,
+      score: 0,
+    });
+  }
+
+  function resetTransientFallDetection(now = Date.now()) {
+    resetFallEvent(now, false, "camera_start_reset");
+    if (fallDetectionEngine) {
+      fallDetectionEngine.reset(now);
+    }
+    lastPersonDetected = false;
+    fallExitStartedAt = null;
+    lastDetectionAt = 0;
+    currentFallScore = 0;
+    latestFallDetectionResult = null;
+    robotVerificationStartedAt = null;
+    robotVerificationUnavailable = false;
+    setFallStage("INITIALIZING", {
+      hasPerson: false,
+      lyingDurationMs: 0,
+      fallStatusText: "Calibrating",
+      now,
+      score: 0,
+      warmupRemainingMs: FALL_DETECTION_CONFIG.cameraWarmupMs,
     });
   }
 
@@ -1318,6 +1721,7 @@
     }
 
     lastDetectionAt = 0;
+    fallDetectionEngine?.reset(Date.now());
     resetFallEvent(Date.now(), false, "stopped");
   }
 
@@ -1340,10 +1744,18 @@
       const result = poseLandmarker.detectForVideo(video, timestamp);
       const landmarks = result.landmarks?.[0] || null;
       const postureInfo = calculatePosture(landmarks);
+      const now = Date.now();
+      const detectionResult = fallDetectionEngine
+        ? fallDetectionEngine.update({
+            landmarks,
+            now,
+            zones: zoneManager ? zoneManager.getZones() : [],
+          })
+        : null;
 
-      updatePoseStatus(postureInfo);
+      updatePoseStatus(postureInfo, detectionResult);
       drawPose(landmarks, postureInfo);
-      handleFallDetection(postureInfo);
+      handleFallDetection(detectionResult, postureInfo, now);
     } catch (error) {
       if (!mediaPipeRuntimeErrorLogged) {
         mediaPipeRuntimeErrorLogged = true;
@@ -1374,12 +1786,12 @@
 
       video.srcObject = stream;
       await video.play();
+      resetTransientFallDetection(Date.now());
       setCameraOnline(true);
       personStatus.textContent = "No person";
       postureStatus.textContent = poseLandmarker
         ? "Unknown"
         : "Loading MediaPipe Pose...";
-      refreshIdleStage(Date.now(), false);
       setFallCommandStatus("");
       updateLastChamiCommandStatus(
         currentChamiCommandId ? `Last: ${currentChamiCommandId}` : "Waiting",
@@ -1417,8 +1829,10 @@
     postureStatus.textContent = "Unknown";
     lastPersonDetected = false;
     refreshIdleStage(Date.now(), false);
+    updateWarmupStatus(0);
     setFallCommandStatus("");
     canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+    drawOverlay();
     addLog("Camera stopped");
     runCameraStatusSync(syncCameraOffline, "Firestore camera status: offline");
   }
@@ -1436,12 +1850,29 @@
       }
       logCameraEvent("Manual demo fall confirmed");
       currentFallEventConfirmed = true;
-      setFallStage("confirmed_fall", {
+      const manualResult = {
+        confidence: 1,
+        score: FALL_DETECTION_CONFIG.confirmedFallScoreThreshold,
+        reasons: ["MANUAL_TEST"],
+        zone: "manual_test",
+        event: { eventId: `manual_test_${Date.now()}` },
+      };
+      const alertId = await sendFallAlert("confirmed", manualResult, 0, {
+        eventId: manualResult.event.eventId,
+        source: "manual_test",
+        isTest: true,
+        verificationResponse: "manual_test",
+      });
+      if (alertId) currentFallAlertId = alertId;
+      setFallStage("CONFIRMED_FALL", {
         hasPerson: true,
         lyingDurationMs: Math.max(CONFIRMED_FALL_MS, getCurrentLyingDuration()),
         fallStatusText: "Confirmed Fall",
+        score: manualResult.score,
+        zone: "manual_test",
       });
-      await handleFallConfirmed();
+      await handleFallConfirmed(manualResult);
+      resetFallEvent(Date.now(), true, "manual_test_complete");
     } catch (error) {
       logCameraEvent("Manual test fall flow failed", "error", error);
       setFallCommandStatus("Không thể gửi yêu cầu kiểm tra tới Chami", "danger");
@@ -1470,6 +1901,14 @@
   testFallAlertButton.addEventListener("click", handleManualTestFallAlert);
   resetFallStateButton.addEventListener("click", handleManualResetFallState);
   clearLogButton.addEventListener("click", clearLocalLog);
+  configureZonesButton?.addEventListener("click", () => setZoneEditing(true));
+  clearZonesButton?.addEventListener("click", clearZoneConfiguration);
+  saveZoneButton?.addEventListener("click", saveCurrentZone);
+  cancelZoneButton?.addEventListener("click", () => setZoneEditing(false));
+  canvas.addEventListener("pointerdown", handleZonePointerDown);
+  canvas.addEventListener("pointermove", handleZonePointerMove);
+  canvas.addEventListener("pointerup", handleZonePointerUp);
+  canvas.addEventListener("pointercancel", handleZonePointerUp);
   video.addEventListener("loadedmetadata", resizeOverlay);
   window.addEventListener("resize", resizeOverlay);
   window.addEventListener("beforeunload", () => stopCamera({ offline: true }));
@@ -1477,6 +1916,7 @@
   setCameraOnline(false);
   setFallCommandStatus("");
   updateLastChamiCommandStatus("Waiting");
+  updateZoneStatus("none");
   refreshIdleStage(Date.now(), false);
   renderLogs();
   startCooldownTicker();
