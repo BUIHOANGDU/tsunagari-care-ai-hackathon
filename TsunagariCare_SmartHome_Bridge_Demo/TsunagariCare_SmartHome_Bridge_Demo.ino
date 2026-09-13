@@ -46,7 +46,8 @@ const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 const unsigned long HTTP_TIMEOUT_MS = 4000;
 const unsigned long DONE_RETRY_INTERVAL_MS = 5000;
 const unsigned long INITIAL_STATUS_RETRY_INTERVAL_MS = 5000;
-const unsigned long ENVIRONMENT_STATUS_SYNC_INTERVAL_MS = 10000;
+const unsigned long SMART_HOME_ENV_SYNC_INTERVAL_MS = 10000;
+const unsigned long SMART_HOME_STATE_SYNC_RETRY_INTERVAL_MS = 5000;
 const unsigned long BME280_READ_INTERVAL_MS = 2000;
 const unsigned long BME280_RETRY_INTERVAL_MS = 10000;
 const uint16_t IR_CAPTURE_BUFFER_SIZE = 1024;
@@ -79,6 +80,7 @@ unsigned long lastWifiRetryAt = 0;
 unsigned long lastDoneRetryAt = 0;
 unsigned long lastInitialStatusSyncAt = 0;
 unsigned long lastEnvironmentStatusSyncAt = 0;
+unsigned long lastSmartHomeStateSyncAttemptAt = 0;
 unsigned long lastBME280ReadAt = 0;
 unsigned long lastBME280RetryAt = 0;
 bool irLearnMode = false;
@@ -88,6 +90,8 @@ bool initialDeviceStatusPending = true;
 bool pendingDoneRetry = false;
 uint8_t bme280Address = 0;
 uint8_t bme280ReadFailures = 0;
+bool environmentValidSampleSyncAttempted = false;
+bool smartHomeStateSyncDirty = true;
 String lastExecutedCommandId = "";
 String pendingDoneCommandId = "";
 String pendingDoneResult = "";
@@ -914,22 +918,48 @@ bool updateDeviceStatus(const String &deviceId, const String &status)
   return updateDeviceStatusDetailed(deviceId, "Unknown Device", "unknown", status);
 }
 
+bool hasValidSmartHomeEnvironmentSample()
+{
+  return smartHomeState.bme280Available &&
+         isValidBME280Reading(
+             smartHomeState.roomTemperature,
+             smartHomeState.humidity,
+             smartHomeState.pressure);
+}
+
+void logSmartHomeStateSnapshot(const char *heading)
+{
+  Serial.println(heading);
+  Serial.print("living=");
+  Serial.print(smartHomeState.livingLight ? 1 : 0);
+  Serial.print(" bedroom=");
+  Serial.print(smartHomeState.bedroomLight ? 1 : 0);
+  Serial.print(" ac=");
+  Serial.print(smartHomeState.acPower ? 1 : 0);
+  Serial.print(" temp=");
+  Serial.println(smartHomeState.acSetTemperature);
+}
+
 bool updateSmartHomeEnvironmentStatus()
 {
-  StaticJsonDocument<384> doc;
+  bool hasValidSample = hasValidSmartHomeEnvironmentSample();
+
+  StaticJsonDocument<512> doc;
   doc["deviceId"] = SMART_HOME_DEVICE_ID;
   doc["name"] = "Smart Home Bridge";
   doc["type"] = "smart_home";
   doc["status"] = "online";
   doc["source"] = SMART_HOME_DEVICE_ID;
 
+  JsonObject smartHome = doc.createNestedObject("smartHome");
+  smartHome["livingLight"] = smartHomeState.livingLight;
+  smartHome["bedroomLight"] = smartHomeState.bedroomLight;
+  smartHome["acPower"] = smartHomeState.acPower;
+  smartHome["acSetTemperature"] = smartHomeState.acSetTemperature;
+
   JsonObject environment = doc.createNestedObject("environment");
-  environment["sensorAvailable"] = smartHomeState.bme280Available;
-  if (smartHomeState.bme280Available &&
-      isValidBME280Reading(
-          smartHomeState.roomTemperature,
-          smartHomeState.humidity,
-          smartHomeState.pressure))
+  environment["sensorAvailable"] = hasValidSample;
+  if (hasValidSample)
   {
     environment["temperature"] = smartHomeState.roomTemperature;
     environment["humidity"] = smartHomeState.humidity;
@@ -939,14 +969,32 @@ bool updateSmartHomeEnvironmentStatus()
   String body;
   serializeJson(doc, body);
 
-  Serial.print("Syncing Smart Home environment: sensorAvailable=");
-  Serial.println(smartHomeState.bme280Available ? "true" : "false");
+  if (hasValidSample)
+  {
+    Serial.println("Smart Home environment sync:");
+    Serial.print("temp=");
+    Serial.println(smartHomeState.roomTemperature, 1);
+    Serial.print("humidity=");
+    Serial.println(smartHomeState.humidity, 0);
+    Serial.print("pressure=");
+    Serial.println(smartHomeState.pressure, 0);
+  }
+  else
+  {
+    Serial.println("BME280 unavailable, syncing sensorAvailable=false");
+  }
+
+  logSmartHomeStateSnapshot("SmartHome state sync:");
+  Serial.println("POST /api/smart-home/device-status");
 
   String responsePayload;
   int statusCode = httpPostBridgeStatus(
       "/api/smart-home/device-status",
       body,
       &responsePayload);
+  Serial.print("status=");
+  Serial.println(statusCode);
+
   return statusCode >= 200 && statusCode < 300;
 }
 
@@ -957,14 +1005,31 @@ void syncSmartHomeEnvironmentStatus(unsigned long now)
     return;
   }
 
-  if (lastEnvironmentStatusSyncAt != 0 &&
-      now - lastEnvironmentStatusSyncAt < ENVIRONMENT_STATUS_SYNC_INTERVAL_MS)
+  bool hasValidSample = hasValidSmartHomeEnvironmentSample();
+  bool immediateSyncPending = smartHomeStateSyncDirty ||
+                              (hasValidSample && !environmentValidSampleSyncAttempted);
+  bool immediateSyncDue = immediateSyncPending &&
+                          (lastSmartHomeStateSyncAttemptAt == 0 ||
+                           now - lastSmartHomeStateSyncAttemptAt >= SMART_HOME_STATE_SYNC_RETRY_INTERVAL_MS);
+  bool periodicSyncDue = lastEnvironmentStatusSyncAt == 0 ||
+                         now - lastEnvironmentStatusSyncAt >= SMART_HOME_ENV_SYNC_INTERVAL_MS;
+
+  if (!immediateSyncDue && !periodicSyncDue)
   {
     return;
   }
 
+  lastSmartHomeStateSyncAttemptAt = now;
   lastEnvironmentStatusSyncAt = now;
-  updateSmartHomeEnvironmentStatus();
+  bool syncOk = updateSmartHomeEnvironmentStatus();
+  if (syncOk)
+  {
+    smartHomeStateSyncDirty = false;
+    if (hasValidSample)
+    {
+      environmentValidSampleSyncAttempted = true;
+    }
+  }
 }
 
 bool markCommandDone(const String &commandId, const String &result, const String &message)
@@ -1249,23 +1314,32 @@ void logDemoOutputConfiguration()
   Serial.println(DEMO_AC_LED_PIN);
 }
 
+void markSmartHomeStateDirty()
+{
+  smartHomeStateSyncDirty = true;
+  lastSmartHomeStateSyncAttemptAt = 0;
+}
+
 void setLivingLightState(bool enabled)
 {
   lightIsOn = enabled;
   smartHomeState.livingLight = enabled;
   applyLivingLightOutput();
+  markSmartHomeStateDirty();
 }
 
 void setBedroomLightState(bool enabled)
 {
   smartHomeState.bedroomLight = enabled;
   applyBedroomLightOutput();
+  markSmartHomeStateDirty();
 }
 
 void setAirConditionerPower(bool enabled)
 {
   smartHomeState.acPower = enabled;
   applyAirConditionerOutput();
+  markSmartHomeStateDirty();
 }
 
 bool isValidAcTemperature(int temperature)
@@ -1291,7 +1365,9 @@ int clampAcTemperature(int temperature)
 
 void setAirConditionerTemperature(int temperature)
 {
-  smartHomeState.acSetTemperature = clampAcTemperature(temperature);
+  int nextTemperature = clampAcTemperature(temperature);
+  smartHomeState.acSetTemperature = nextTemperature;
+  markSmartHomeStateDirty();
 }
 
 void applyIrStateHint(const String &key)
@@ -1371,6 +1447,7 @@ void dispatchV2LightCommand(const SmartHomeCommand &command)
     setBedroomLightState(nextState);
   }
 
+  logSmartHomeStateSnapshot("SmartHome state:");
   rememberCommandExecution(command);
   notifyCommandSuccess(command);
   completeCommand(
@@ -1431,6 +1508,7 @@ void dispatchV2AirConditionerCommand(const SmartHomeCommand &command)
     return;
   }
 
+  logSmartHomeStateSnapshot("SmartHome state:");
   rememberCommandExecution(command);
   notifyCommandSuccess(command);
   completeCommand(command, result, "Air conditioner command executed");
@@ -1500,6 +1578,15 @@ void dispatchCommand(const SmartHomeCommand &command)
   Serial.print(command.device);
   Serial.print(" action=");
   Serial.println(command.action);
+
+  if (command.type == "device_control" && isV2DeviceId(command.device))
+  {
+    Serial.println("SmartHome command:");
+    Serial.print("device=");
+    Serial.println(command.device);
+    Serial.print("action=");
+    Serial.println(command.action);
+  }
 
   if (isDuplicateCommand(command))
   {

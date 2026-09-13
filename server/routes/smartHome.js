@@ -83,6 +83,52 @@ function buildEnvironmentUpdate(input) {
   return environment;
 }
 
+function asOptionalBoolean(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "on", "1"].includes(normalized)) return true;
+    if (["false", "off", "0"].includes(normalized)) return false;
+  }
+
+  return null;
+}
+
+function buildSmartHomeStateUpdate(input) {
+  if (input === undefined) {
+    return null;
+  }
+
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    const error = new Error("smartHome must be an object");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const update = {
+    updatedAt: getServerTimestamp(),
+  };
+
+  const livingLight = asOptionalBoolean(input.livingLight);
+  const bedroomLight = asOptionalBoolean(input.bedroomLight);
+  const acPower = asOptionalBoolean(input.acPower);
+  const acSetTemperature = asOptionalFiniteNumber(input.acSetTemperature);
+
+  if (livingLight !== null) update.livingLight = livingLight;
+  if (bedroomLight !== null) update.bedroomLight = bedroomLight;
+  if (acPower !== null) update.acPower = acPower;
+  if (acSetTemperature !== null) update.acSetTemperature = acSetTemperature;
+
+  return update;
+}
+
 function getMissingIrCommandField(body = {}) {
   if (typeof body.key !== "string" || body.key.trim() === "") {
     return "key";
@@ -171,6 +217,7 @@ router.post("/commands", deviceAuth, async (req, res) => {
       category: req.body.category || "",
       description: req.body.description || "",
       status: req.body.status || "pending",
+      value: req.body.value,
     });
 
     return res.status(200).json({
@@ -405,6 +452,7 @@ router.post("/device-status", deviceAuth, async (req, res) => {
     status,
     source = "smart_home_001",
     environment,
+    smartHome,
   } = req.body || {};
 
   if (!deviceId) {
@@ -423,6 +471,7 @@ router.post("/device-status", deviceAuth, async (req, res) => {
 
   try {
     const environmentUpdate = buildEnvironmentUpdate(environment);
+    const smartHomeUpdate = buildSmartHomeStateUpdate(smartHome);
     const updatePayload = {
       id: deviceId,
       name: name || deviceId,
@@ -436,14 +485,28 @@ router.post("/device-status", deviceAuth, async (req, res) => {
       updatePayload.environment = environmentUpdate;
     }
 
+    if (smartHomeUpdate) {
+      updatePayload.smartHome = smartHomeUpdate;
+    }
+
     await getDb()
       .ref(`devices/${deviceId}`)
       .update(updatePayload);
+
+    if (smartHomeUpdate) {
+      console.log("Smart Home bridge state updated:", {
+        living: smartHomeUpdate.livingLight,
+        bedroom: smartHomeUpdate.bedroomLight,
+        ac: smartHomeUpdate.acPower,
+        temp: smartHomeUpdate.acSetTemperature,
+      });
+    }
 
     return res.json({
       ok: true,
       deviceId,
       environmentUpdated: Boolean(environmentUpdate),
+      smartHomeUpdated: Boolean(smartHomeUpdate),
       message: "Device status updated",
     });
   } catch (error) {

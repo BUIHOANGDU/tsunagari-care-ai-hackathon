@@ -4,6 +4,15 @@ function normalizeString(value, fallback = "") {
   return typeof value === "string" ? value.trim() : fallback;
 }
 
+function normalizeOptionalNumber(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function getMissingCommandField(body = {}) {
   const requiredFields = ["targetDeviceId", "type", "device", "action"];
 
@@ -38,6 +47,11 @@ async function createSmartHomeCommand(commandPayload = {}) {
     createdAt: now,
     updatedAt: now,
   };
+  const value = normalizeOptionalNumber(commandPayload.value);
+
+  if (value !== null) {
+    command.value = value;
+  }
 
   await commandRef.set(command);
 
